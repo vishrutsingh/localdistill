@@ -28,6 +28,10 @@ from quality import AUTO_PROMOTE_THRESHOLD, should_auto_promote, should_auto_exc
 app = FastAPI(title="localdistill-api")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+@app.get("/")
+async def root():
+    return {"app": "localdistill", "endpoints": {"health": "/health", "status": "/api/status", "conversations": "/api/conversations", "export": "/api/export?format=chatml"}}
+
 DATA_DIR = Path("/data")
 
 
