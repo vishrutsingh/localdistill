@@ -292,13 +292,13 @@ echo "  ${BOLD}Recommended base models:${NC}"
 echo ""
 
 for i in "${!MODELS[@]}"; do
-  local tag=""
+  tag=""
   case "${MODEL_TIER[$i]}" in
     fast)     tag="${GREEN}⚡ fast${NC}" ;;
     balanced) tag="${CYAN}⚖ balanced${NC}" ;;
     cloud)    tag="${YELLOW}☁ cloud${NC}" ;;
   esac
-  local marker=" "
+  marker=" "
   [[ "${MODEL_HF[$i]}" == "$CURRENT_MODEL" ]] && marker="${GREEN}▶${NC}"
   printf "    ${GREEN}%d)${NC} %-35s ${DIM}%-5s${NC} %s\n" \
     "$((i+1))" "${MODELS[$i]}" "${MODEL_SIZE[$i]}" "$tag"
@@ -310,7 +310,7 @@ printf "    ${DIM}%d)${NC} Custom (enter HuggingFace model ID)\n" "$((${#MODELS[
 echo ""
 
 # Determine default choice
-local default=1
+default=1
 for i in "${!MODEL_HF[@]}"; do
   [[ "${MODEL_HF[$i]}" == "$CURRENT_MODEL" ]] && default=$((i+1))
 done
