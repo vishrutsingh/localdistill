@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "proxy"))
 
 from mcp.server.fastmcp import FastMCP
 from db import get_db, get_conversation, get_unreviewed_conversations
