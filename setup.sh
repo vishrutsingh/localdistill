@@ -229,21 +229,15 @@ OPENAI_SET=false; ANTHROPIC_SET=false; OPENROUTER_SET=false
 [[ -n "${ANTHROPIC_API_KEY:-}"   ]] && ANTHROPIC_SET=true
 [[ -n "${OPENROUTER_API_KEY:-}"  ]] && OPENROUTER_SET=true
 
-ALL_SET=false
-$OPENAI_SET && $ANTHROPIC_SET && $OPENROUTER_SET && ALL_SET=true
-
 _read_key() { local var="$1" hint="$2"; local cur="${!var}"; local d=""; [[ -n "$cur" ]] && d=" ${DIM}[Enter to keep ${cur:0:8}...]${NC}"; printf "    ${CYAN}?${NC} ${var} ${DIM}($hint)${NC}${d}: "; read -r k; k="${k:-$cur}"; [[ -n "$k" ]] && { sed -i "/^${var}=/d" .env 2>/dev/null; echo "${var}=$k" >> .env; export "$var"="$k"; return 0; }; return 1; }
 
-_pick_model() {
-  local prov="$1" model_var="$2" models=("${@:3}")
-  echo ""
-  echo "  ${BOLD}Select $prov model:${NC}"
+_pick_model() { local prov="$1" model_var="$2"; shift 2; local models=("$@")
+  echo ""; echo "  ${BOLD}Select $prov model:${NC}"
   for i in "${!models[@]}"; do printf "    ${GREEN}%d)${NC} %s\n" "$((i+1))" "${models[$i]}"; done
-  printf "    ${DIM}%d)${NC} Custom ID\n" "$((${#models[@]}+1))"
-  echo ""
+  printf "    ${DIM}%d)${NC} Custom ID\n" "$((${#models[@]}+1))"; echo ""
   printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r c; c="${c:-1}"
   if [[ "$c" -le "${#models[@]}" ]] 2>/dev/null && [[ "$c" -ge 1 ]]; then
-    local m="${models[$((c-1))]}"; m="${m%% *}"  # first word = model ID
+    local m="${models[$((c-1))]}"; m="${m%% *}"
     sed -i "/^${model_var}=/d" .env 2>/dev/null; echo "${model_var}=$m" >> .env; export "$model_var"="$m"
   elif [[ "$c" -eq "$((${#models[@]}+1))" ]] 2>/dev/null; then
     printf "    ${CYAN}?${NC} Model ID: "; read -r m
@@ -252,18 +246,30 @@ _pick_model() {
   _ok "$prov model: ${!model_var}"
 }
 
-echo "    ${GREEN}1)${NC} OpenAI ${DIM}(gpt-4o, gpt-4o-mini)${NC}"
-echo "    ${GREEN}2)${NC} Anthropic ${DIM}(claude-sonnet-4, haiku)${NC}"
-echo "    ${GREEN}3)${NC} OpenRouter ${DIM}(any model, one key)${NC}"
-echo "    ${GREEN}4)${NC} All three"
-echo "    ${DIM}5)${NC} Skip"
-echo ""
-printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r prov; prov="${prov:-1}"
+_do_openai()    { _read_key OPENAI_API_KEY "sk-..." && _pick_model OpenAI    LOCALDISTILL_API_MODEL "openai/gpt-4o  (flagship)" "openai/gpt-4o-mini  (fast, cheap)" "openai/o3-mini  (reasoning)"; }
+_do_anthropic() { _read_key ANTHROPIC_API_KEY "sk-ant-..." && _pick_model Anthropic LOCALDISTILL_API_MODEL "anthropic/claude-sonnet-4  (best balance)" "anthropic/claude-haiku-4  (fast)" "anthropic/claude-opus-4  (strongest)"; }
+_do_openrouter(){ _read_key OPENROUTER_API_KEY "sk-or-..." && _pick_model OpenRouter LOCALDISTILL_API_MODEL "deepseek/deepseek-v4-pro  (best all-around)" "anthropic/claude-sonnet-4" "openai/gpt-4o" "google/gemini-2.5-flash" "meta-llama/llama-4-maverick"; }
+_pick_model_openai()    { _pick_model OpenAI    LOCALDISTILL_API_MODEL "openai/gpt-4o  (flagship)" "openai/gpt-4o-mini  (fast, cheap)" "openai/o3-mini  (reasoning)"; }
+_pick_model_anthropic() { _pick_model Anthropic LOCALDISTILL_API_MODEL "anthropic/claude-sonnet-4  (best balance)" "anthropic/claude-haiku-4  (fast)" "anthropic/claude-opus-4  (strongest)"; }
+_pick_model_openrouter(){ _pick_model OpenRouter LOCALDISTILL_API_MODEL "deepseek/deepseek-v4-pro  (best all-around)" "anthropic/claude-sonnet-4" "openai/gpt-4o" "google/gemini-2.5-flash" "meta-llama/llama-4-maverick"; }
 
-  _do_openai() { _read_key OPENAI_API_KEY "sk-..." && _pick_model OpenAI LOCALDISTILL_API_MODEL "openai/gpt-4o  (flagship)" "openai/gpt-4o-mini  (fast, cheap)" "openai/o3-mini  (reasoning)"; }
-  _do_anthropic() { _read_key ANTHROPIC_API_KEY "sk-ant-..." && _pick_model Anthropic LOCALDISTILL_API_MODEL "anthropic/claude-sonnet-4  (best balance)" "anthropic/claude-haiku-4  (fast)" "anthropic/claude-opus-4  (strongest)"; }
-  _do_openrouter() { _read_key OPENROUTER_API_KEY "sk-or-..." && _pick_model OpenRouter LOCALDISTILL_API_MODEL "deepseek/deepseek-v4-pro  (best all-around)" "anthropic/claude-sonnet-4" "openai/gpt-4o" "google/gemini-2.5-flash" "meta-llama/llama-4-maverick"; }
+COUNT=$($OPENAI_SET && echo 1 || echo 0)
+COUNT=$((COUNT + $($ANTHROPIC_SET && echo 1 || echo 0)))
+COUNT=$((COUNT + $($OPENROUTER_SET && echo 1 || echo 0)))
 
+# Auto-select if exactly one provider configured
+if [[ $COUNT -eq 1 ]]; then
+  $OPENAI_SET     && { _info "Using OpenAI (key detected)";       _pick_model_openai; }
+  $ANTHROPIC_SET  && { _info "Using Anthropic (key detected)";    _pick_model_anthropic; }
+  $OPENROUTER_SET && { _info "Using OpenRouter (key detected)";   _pick_model_openrouter; }
+else
+  echo "    ${GREEN}1)${NC} OpenAI ${DIM}(gpt-4o, gpt-4o-mini)${NC}"
+  echo "    ${GREEN}2)${NC} Anthropic ${DIM}(claude-sonnet-4, haiku)${NC}"
+  echo "    ${GREEN}3)${NC} OpenRouter ${DIM}(any model, one key)${NC}"
+  echo "    ${GREEN}4)${NC} All three"
+  echo "    ${DIM}5)${NC} Skip"
+  echo ""
+  printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r prov; prov="${prov:-1}"
   case "$prov" in
     1) _do_openai ;;
     2) _do_anthropic ;;
@@ -271,10 +277,7 @@ printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r prov; prov="${prov:-1}
     4) _do_openai; _do_anthropic; _do_openrouter ;;
     *) _info "Skipping" ;;
   esac
-
-source .env 2>/dev/null || true
-
-# ═══════════════════════════════════════════════════════════════
+fi
 # Step 3: Select base model for training
 # ═══════════════════════════════════════════════════════════════
 
