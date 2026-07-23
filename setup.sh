@@ -204,45 +204,56 @@ echo ""
 echo "  ${BOLD}Select providers to configure:${NC}"
 echo ""
 
-CONFIGURED_ANY=false
-
 # Check existing keys
-OPENAI_SET=false; ANTHROPIC_SET=false
-[[ -n "${OPENAI_API_KEY:-}"   ]] && OPENAI_SET=true
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] && ANTHROPIC_SET=true
+OPENAI_SET=false; ANTHROPIC_SET=false; OPENROUTER_SET=false
+[[ -n "${OPENAI_API_KEY:-}"     ]] && OPENAI_SET=true
+[[ -n "${ANTHROPIC_API_KEY:-}"   ]] && ANTHROPIC_SET=true
+[[ -n "${OPENROUTER_API_KEY:-}"  ]] && OPENROUTER_SET=true
 
-if $OPENAI_SET && $ANTHROPIC_SET; then
-  _ok "Both already configured — skipping"
-else
-  echo "    ${GREEN}1)${NC} OpenAI ${DIM}(GPT-4o, GPT-4o-mini)${NC}"
-  echo "    ${GREEN}2)${NC} Anthropic ${DIM}(Claude Sonnet, Haiku)${NC}"
-  echo "    ${GREEN}3)${NC} Both"
-  echo "    ${DIM}4)${NC} Skip ${DIM}(rely on env vars)${NC}"
+ALL_SET=false
+$OPENAI_SET && $ANTHROPIC_SET && $OPENROUTER_SET && ALL_SET=true
+
+_read_key() { local var="$1" hint="$2"; printf "    ${CYAN}?${NC} API key ${DIM}($hint)${NC}: "; read -r k; [[ -n "$k" ]] && { sed -i "/^${var}=/d" .env 2>/dev/null; echo "${var}=$k" >> .env; export "$var"="$k"; return 0; }; return 1; }
+
+_pick_model() {
+  local prov="$1" model_var="$2" models=("${@:3}")
   echo ""
-  printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "
-  read -r prov; prov="${prov:-1}"
+  echo "  ${BOLD}Select $prov model:${NC}"
+  for i in "${!models[@]}"; do printf "    ${GREEN}%d)${NC} %s\n" "$((i+1))" "${models[$i]}"; done
+  printf "    ${DIM}%d)${NC} Custom ID\n" "$((${#models[@]}+1))"
+  echo ""
+  printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r c; c="${c:-1}"
+  if [[ "$c" -le "${#models[@]}" ]] 2>/dev/null && [[ "$c" -ge 1 ]]; then
+    local m="${models[$((c-1))]}"; m="${m%% *}"  # first word = model ID
+    sed -i "/^${model_var}=/d" .env 2>/dev/null; echo "${model_var}=$m" >> .env; export "$model_var"="$m"
+  elif [[ "$c" -eq "$((${#models[@]}+1))" ]] 2>/dev/null; then
+    printf "    ${CYAN}?${NC} Model ID: "; read -r m
+    sed -i "/^${model_var}=/d" .env 2>/dev/null; echo "${model_var}=$m" >> .env; export "$model_var"="$m"
+  fi
+  _ok "$prov model: ${!model_var}"
+}
 
-  _save_key() {
-    local name="$1" var="$2" hint="$3"
-    printf "    ${CYAN}?${NC} $name API key ${DIM}($hint)${NC}: "
-    read -r key
-    if [[ -n "$key" ]]; then
-      sed -i "/^${var}=/d" .env 2>/dev/null || true
-      echo "${var}=$key" >> .env
-      export "$var"="$key"
-      _ok "$name saved"
-      CONFIGURED_ANY=true
-    else
-      _info "$name skipped"
-    fi
-  }
+if $ALL_SET; then
+  _ok "All providers already configured — skipping"
+else
+  echo "    ${GREEN}1)${NC} OpenAI ${DIM}(gpt-4o, gpt-4o-mini)${NC}"
+  echo "    ${GREEN}2)${NC} Anthropic ${DIM}(claude-sonnet-4, haiku)${NC}"
+  echo "    ${GREEN}3)${NC} OpenRouter ${DIM}(any model, one key)${NC}"
+  echo "    ${GREEN}4)${NC} All three"
+  echo "    ${DIM}5)${NC} Skip"
+  echo ""
+  printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r prov; prov="${prov:-1}"
+
+  _do_openai() { _read_key OPENAI_API_KEY "sk-..." && _pick_model OpenAI LOCALDISTILL_API_MODEL "openai/gpt-4o  (flagship)" "openai/gpt-4o-mini  (fast, cheap)" "openai/o3-mini  (reasoning)"; }
+  _do_anthropic() { _read_key ANTHROPIC_API_KEY "sk-ant-..." && _pick_model Anthropic LOCALDISTILL_API_MODEL "anthropic/claude-sonnet-4  (best balance)" "anthropic/claude-haiku-4  (fast)" "anthropic/claude-opus-4  (strongest)"; }
+  _do_openrouter() { _read_key OPENROUTER_API_KEY "sk-or-..." && _pick_model OpenRouter LOCALDISTILL_API_MODEL "deepseek/deepseek-v4-pro  (best all-around)" "anthropic/claude-sonnet-4" "openai/gpt-4o" "google/gemini-2.5-flash" "meta-llama/llama-4-maverick"; }
 
   case "$prov" in
-    1) _save_key "OpenAI"    "OPENAI_API_KEY"    "sk-..."    ;;
-    2) _save_key "Anthropic" "ANTHROPIC_API_KEY" "sk-ant-..." ;;
-    3) _save_key "OpenAI"    "OPENAI_API_KEY"    "sk-..."
-       _save_key "Anthropic" "ANTHROPIC_API_KEY" "sk-ant-..." ;;
-    *) _info "Skipping — add keys to .env manually" ;;
+    1) _do_openai ;;
+    2) _do_anthropic ;;
+    3) _do_openrouter ;;
+    4) _do_openai; _do_anthropic; _do_openrouter ;;
+    *) _info "Skipping" ;;
   esac
 fi
 
