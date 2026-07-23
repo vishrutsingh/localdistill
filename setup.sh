@@ -33,7 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 STEP=0
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 HAS_GPU=false
 SKIP_BUILD=false
 SKIP_MCP=false
@@ -296,24 +296,151 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════
-# Step 6: MCP registration
+# Step 6: Detect MCP clients
 # ═══════════════════════════════════════════════════════════════
 
-_step "Registering MCP server"
+_step "Detecting MCP clients"
 
-if $SKIP_MCP; then
-  _info "Skipping MCP registration (--no-mcp)"
-elif command -v hermes &>/dev/null; then
-  if hermes mcp list 2>/dev/null | grep -q "localdistill"; then
-    _ok "MCP server already registered with Hermes"
-  else
-    hermes mcp add localdistill --command "python $SCRIPT_DIR/mcp/mcp_server.py" 2>&1 || true
-    _ok "localdistill-curator registered with Hermes"
-    _info "Tools: signal_quality, get_last_conversation, search_knowledge, add_to_rag, get_training_status"
-  fi
+MCP_CMD="python $SCRIPT_DIR/mcp/mcp_server.py"
+MCP_CONFIG='{
+  "mcpServers": {
+    "localdistill": {
+      "command": "python",
+      "args": ["'"$SCRIPT_DIR"'/mcp/mcp_server.py"]
+    }
+  }
+}'
+
+DETECTED_CLIENTS=()
+command -v hermes  &>/dev/null && DETECTED_CLIENTS+=("hermes")
+[[ -f "$HOME/Library/Application Support/Claude/claude_desktop_config.json" ]] && DETECTED_CLIENTS+=("claude-desktop")
+[[ -f "$HOME/.vscode/mcp.json" ]] && DETECTED_CLIENTS+=("vscode")
+command -v cursor  &>/dev/null && DETECTED_CLIENTS+=("cursor")
+command -v claude  &>/dev/null && DETECTED_CLIENTS+=("claude-code")
+command -v codex   &>/dev/null && DETECTED_CLIENTS+=("codex")
+
+if [[ ${#DETECTED_CLIENTS[@]} -gt 0 ]]; then
+  echo ""
+  echo "  ${BOLD}Detected MCP-compatible tools:${NC}"
+  for i in "${!DETECTED_CLIENTS[@]}"; do
+    printf "    ${GREEN}%d)${NC} %s\n" "$((i+1))" "${DETECTED_CLIENTS[$i]}"
+  done
+  printf "    ${DIM}%d)${NC} Other (print config for manual setup)\n" "$((${#DETECTED_CLIENTS[@]}+1))"
+  printf "    ${DIM}%d)${NC} Skip MCP setup\n" "$((${#DETECTED_CLIENTS[@]}+2))"
+  echo ""
+  printf "    ${CYAN}?${NC} Select tool to configure ${DIM}[1]${NC}: "
+  read -r choice
+  choice="${choice:-1}"
 else
-  _warn "Hermes CLI not found — MCP not registered"
-  _info "To add manually: hermes mcp add localdistill --command \"python $(pwd)/mcp/mcp_server.py\""
+  _info "No MCP-compatible tools detected"
+  choice=""
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# Step 7: Configure MCP
+# ═══════════════════════════════════════════════════════════════
+
+_step "Configuring MCP server"
+
+configured=false
+
+_mcp_done() {
+  configured=true
+  _ok "$1 MCP configured — tools: signal_quality, get_last_conversation, search_knowledge, add_to_rag, get_training_status"
+}
+
+_print_manual() {
+  echo ""
+  echo "  ${YELLOW}Add this to your MCP client config:${NC}"
+  echo ""
+  echo "$MCP_CONFIG"
+  echo ""
+}
+
+case "${DETECTED_CLIENTS[$((choice-1))]:-}" in
+  hermes)
+    if hermes mcp list 2>/dev/null | grep -q "localdistill"; then
+      _ok "Already registered with Hermes"
+    else
+      hermes mcp add localdistill --command "$MCP_CMD" 2>&1 && _mcp_done "Hermes" || _print_manual
+    fi
+    ;;
+  claude-desktop)
+    # Merge into Claude Desktop config
+    cf="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+    if [[ -f "$cf" ]]; then
+      python3 -c "
+import json, sys
+with open('$cf') as f: cfg = json.load(f)
+cfg.setdefault('mcpServers', {})['localdistill'] = {'command': 'python', 'args': ['$SCRIPT_DIR/mcp/mcp_server.py']}
+with open('$cf', 'w') as f: json.dump(cfg, f, indent=2)
+print('ok')
+" 2>/dev/null && _mcp_done "Claude Desktop" || _print_manual
+    else
+      _warn "Claude Desktop config not found at $cf"
+      _print_manual
+    fi
+    ;;
+  vscode)
+    vf="$HOME/.vscode/mcp.json"
+    python3 -c "
+import json, os
+cfg = {}
+if os.path.exists('$vf'):
+    with open('$vf') as f: cfg = json.load(f)
+cfg.setdefault('mcpServers', {})['localdistill'] = {'command': 'python', 'args': ['$SCRIPT_DIR/mcp/mcp_server.py']}
+os.makedirs(os.path.dirname('$vf'), exist_ok=True)
+with open('$vf', 'w') as f: json.dump(cfg, f, indent=2)
+print('ok')
+" 2>/dev/null && _mcp_done "VS Code" || _print_manual
+    ;;
+  cursor)
+    cf="$HOME/.cursor/mcp.json"
+    python3 -c "
+import json, os
+cfg = {}
+if os.path.exists('$cf'):
+    with open('$cf') as f: cfg = json.load(f)
+cfg.setdefault('mcpServers', {})['localdistill'] = {'command': 'python', 'args': ['$SCRIPT_DIR/mcp/mcp_server.py']}
+os.makedirs(os.path.dirname('$cf'), exist_ok=True)
+with open('$cf', 'w') as f: json.dump(cfg, f, indent=2)
+print('ok')
+" 2>/dev/null && _mcp_done "Cursor" || _print_manual
+    ;;
+  claude-code)
+    cf="$HOME/.claude/mcp.json"
+    python3 -c "
+import json, os
+cfg = {}
+if os.path.exists('$cf'):
+    with open('$cf') as f: cfg = json.load(f)
+cfg.setdefault('mcpServers', {})['localdistill'] = {'command': 'python', 'args': ['$SCRIPT_DIR/mcp/mcp_server.py']}
+os.makedirs(os.path.dirname('$cf'), exist_ok=True)
+with open('$cf', 'w') as f: json.dump(cfg, f, indent=2)
+print('ok')
+" 2>/dev/null && _mcp_done "Claude Code" || _print_manual
+    ;;
+  codex)
+    cf="$HOME/.codex/mcp.json"
+    python3 -c "
+import json, os
+cfg = {}
+if os.path.exists('$cf'):
+    with open('$cf') as f: cfg = json.load(f)
+cfg.setdefault('mcpServers', {})['localdistill'] = {'command': 'python', 'args': ['$SCRIPT_DIR/mcp/mcp_server.py']}
+os.makedirs(os.path.dirname('$cf'), exist_ok=True)
+with open('$cf', 'w') as f: json.dump(cfg, f, indent=2)
+print('ok')
+" 2>/dev/null && _mcp_done "Codex" || _print_manual
+    ;;
+  *)
+    _info "MCP setup skipped"
+    _print_manual
+    ;;
+esac
+
+if ! $configured && [[ -n "${choice:-}" ]] && [[ "$choice" != "$((${#DETECTED_CLIENTS[@]}+2))" ]]; then
+  _print_manual
 fi
 
 # ═══════════════════════════════════════════════════════════════
