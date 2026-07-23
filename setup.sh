@@ -213,7 +213,7 @@ OPENAI_SET=false; ANTHROPIC_SET=false; OPENROUTER_SET=false
 ALL_SET=false
 $OPENAI_SET && $ANTHROPIC_SET && $OPENROUTER_SET && ALL_SET=true
 
-_read_key() { local var="$1" hint="$2"; printf "    ${CYAN}?${NC} API key ${DIM}($hint)${NC}: "; read -r k; [[ -n "$k" ]] && { sed -i "/^${var}=/d" .env 2>/dev/null; echo "${var}=$k" >> .env; export "$var"="$k"; return 0; }; return 1; }
+_read_key() { local var="$1" hint="$2"; local cur="${!var}"; local d=""; [[ -n "$cur" ]] && d=" ${DIM}[Enter to keep ${cur:0:8}...]${NC}"; printf "    ${CYAN}?${NC} ${var} ${DIM}($hint)${NC}${d}: "; read -r k; k="${k:-$cur}"; [[ -n "$k" ]] && { sed -i "/^${var}=/d" .env 2>/dev/null; echo "${var}=$k" >> .env; export "$var"="$k"; return 0; }; return 1; }
 
 _pick_model() {
   local prov="$1" model_var="$2" models=("${@:3}")
@@ -233,16 +233,13 @@ _pick_model() {
   _ok "$prov model: ${!model_var}"
 }
 
-if $ALL_SET; then
-  _ok "All providers already configured — skipping"
-else
-  echo "    ${GREEN}1)${NC} OpenAI ${DIM}(gpt-4o, gpt-4o-mini)${NC}"
-  echo "    ${GREEN}2)${NC} Anthropic ${DIM}(claude-sonnet-4, haiku)${NC}"
-  echo "    ${GREEN}3)${NC} OpenRouter ${DIM}(any model, one key)${NC}"
-  echo "    ${GREEN}4)${NC} All three"
-  echo "    ${DIM}5)${NC} Skip"
-  echo ""
-  printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r prov; prov="${prov:-1}"
+echo "    ${GREEN}1)${NC} OpenAI ${DIM}(gpt-4o, gpt-4o-mini)${NC}"
+echo "    ${GREEN}2)${NC} Anthropic ${DIM}(claude-sonnet-4, haiku)${NC}"
+echo "    ${GREEN}3)${NC} OpenRouter ${DIM}(any model, one key)${NC}"
+echo "    ${GREEN}4)${NC} All three"
+echo "    ${DIM}5)${NC} Skip"
+echo ""
+printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "; read -r prov; prov="${prov:-1}"
 
   _do_openai() { _read_key OPENAI_API_KEY "sk-..." && _pick_model OpenAI LOCALDISTILL_API_MODEL "openai/gpt-4o  (flagship)" "openai/gpt-4o-mini  (fast, cheap)" "openai/o3-mini  (reasoning)"; }
   _do_anthropic() { _read_key ANTHROPIC_API_KEY "sk-ant-..." && _pick_model Anthropic LOCALDISTILL_API_MODEL "anthropic/claude-sonnet-4  (best balance)" "anthropic/claude-haiku-4  (fast)" "anthropic/claude-opus-4  (strongest)"; }
@@ -255,7 +252,6 @@ else
     4) _do_openai; _do_anthropic; _do_openrouter ;;
     *) _info "Skipping" ;;
   esac
-fi
 
 source .env 2>/dev/null || true
 
