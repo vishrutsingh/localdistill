@@ -198,39 +198,55 @@ else
   _ok ".env already exists (skipped)"
 fi
 
-# Inline API key prompts
-echo ""
-echo "  ${BOLD}API Keys${NC}"
-echo "  ${DIM}─────────────────────────────────────────────────${NC}"
-
-# Load any existing keys
 source .env 2>/dev/null || true
-HAD_OPENAI="${OPENAI_API_KEY:-}"
 
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  printf "    ${CYAN}?${NC} OpenAI API key ${DIM}(sk-...) [skip]${NC}: "
-  read -r key
-  if [[ -n "$key" ]]; then
-    sed -i "/^OPENAI_API_KEY=/d" .env 2>/dev/null || true
-    echo "OPENAI_API_KEY=$key" >> .env
-    export OPENAI_API_KEY="$key"
-    _ok "OpenAI API key saved"
-  else
-    _warn "OPENAI_API_KEY not set — proxy won't route API calls"
-  fi
-elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
-  _ok "OpenAI API key ${DIM}(already configured)${NC}"
-fi
+echo ""
+echo "  ${BOLD}Select providers to configure:${NC}"
+echo ""
 
-printf "    ${CYAN}?${NC} Anthropic API key ${DIM}(sk-ant-...) [skip]${NC}: "
-read -r ant_key
-if [[ -n "$ant_key" ]]; then
-  sed -i "/^ANTHROPIC_API_KEY=/d" .env 2>/dev/null || true
-  echo "ANTHROPIC_API_KEY=$ant_key" >> .env
-  _ok "Anthropic API key saved"
+CONFIGURED_ANY=false
+
+# Check existing keys
+OPENAI_SET=false; ANTHROPIC_SET=false
+[[ -n "${OPENAI_API_KEY:-}"   ]] && OPENAI_SET=true
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] && ANTHROPIC_SET=true
+
+if $OPENAI_SET && $ANTHROPIC_SET; then
+  _ok "Both already configured — skipping"
 else
-  _info "Anthropic API key skipped"
+  echo "    ${GREEN}1)${NC} OpenAI ${DIM}(GPT-4o, GPT-4o-mini)${NC}"
+  echo "    ${GREEN}2)${NC} Anthropic ${DIM}(Claude Sonnet, Haiku)${NC}"
+  echo "    ${GREEN}3)${NC} Both"
+  echo "    ${DIM}4)${NC} Skip ${DIM}(rely on env vars)${NC}"
+  echo ""
+  printf "    ${CYAN}?${NC} Pick ${DIM}[1]${NC}: "
+  read -r prov; prov="${prov:-1}"
+
+  _save_key() {
+    local name="$1" var="$2" hint="$3"
+    printf "    ${CYAN}?${NC} $name API key ${DIM}($hint)${NC}: "
+    read -r key
+    if [[ -n "$key" ]]; then
+      sed -i "/^${var}=/d" .env 2>/dev/null || true
+      echo "${var}=$key" >> .env
+      export "$var"="$key"
+      _ok "$name saved"
+      CONFIGURED_ANY=true
+    else
+      _info "$name skipped"
+    fi
+  }
+
+  case "$prov" in
+    1) _save_key "OpenAI"    "OPENAI_API_KEY"    "sk-..."    ;;
+    2) _save_key "Anthropic" "ANTHROPIC_API_KEY" "sk-ant-..." ;;
+    3) _save_key "OpenAI"    "OPENAI_API_KEY"    "sk-..."
+       _save_key "Anthropic" "ANTHROPIC_API_KEY" "sk-ant-..." ;;
+    *) _info "Skipping — add keys to .env manually" ;;
+  esac
 fi
+
+source .env 2>/dev/null || true
 
 # ═══════════════════════════════════════════════════════════════
 # Step 3: Select base model for training
