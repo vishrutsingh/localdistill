@@ -229,7 +229,7 @@ OPENAI_SET=false; ANTHROPIC_SET=false; OPENROUTER_SET=false
 [[ -n "${ANTHROPIC_API_KEY:-}"   ]] && ANTHROPIC_SET=true
 [[ -n "${OPENROUTER_API_KEY:-}"  ]] && OPENROUTER_SET=true
 
-_read_key() { local var="$1" hint="$2"; local cur="${!var}"; local d=""; [[ -n "$cur" ]] && d=" ${DIM}[Enter to keep ${cur:0:8}...]${NC}"; printf "    ${CYAN}?${NC} ${var} ${DIM}($hint)${NC}${d}: "; read -r k; k="${k:-$cur}"; [[ -n "$k" ]] && { sed -i "/^${var}=/d" .env 2>/dev/null; echo "${var}=$k" >> .env; export "$var"="$k"; return 0; }; return 1; }
+_read_key() { local var="$1" hint="$2"; local cur d=""; set +u; cur="${!var}"; set -u; [[ -n "$cur" ]] && d=" ${DIM}[Enter to keep ${cur:0:8}...]${NC}"; printf "    ${CYAN}?${NC} ${var} ${DIM}($hint)${NC}${d}: "; read -r k; k="${k:-$cur}"; [[ -n "$k" ]] && { sed -i "/^${var}=/d" .env 2>/dev/null; echo "${var}=$k" >> .env; export "$var"="$k"; return 0; }; return 1; }
 
 _pick_model() { local prov="$1" model_var="$2"; shift 2; local models=("$@")
   echo ""; echo "  ${BOLD}Select $prov model:${NC}"
@@ -243,7 +243,7 @@ _pick_model() { local prov="$1" model_var="$2"; shift 2; local models=("$@")
     printf "    ${CYAN}?${NC} Model ID: "; read -r m
     sed -i "/^${model_var}=/d" .env 2>/dev/null; echo "${model_var}=$m" >> .env; export "$model_var"="$m"
   fi
-  _ok "$prov model: ${!model_var}"
+  _ok "$prov model: $(set +u; printf '%s' "${!model_var}"; set -u)"
 }
 
 _do_openai()    { _read_key OPENAI_API_KEY "sk-..." && _pick_model OpenAI    LOCALDISTILL_API_MODEL "openai/gpt-4o  (flagship)" "openai/gpt-4o-mini  (fast, cheap)" "openai/o3-mini  (reasoning)"; }
@@ -278,6 +278,7 @@ else
     *) _info "Skipping" ;;
   esac
 fi
+source .env 2>/dev/null || true
 # Step 3: Select base model for training
 # ═══════════════════════════════════════════════════════════════
 
