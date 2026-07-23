@@ -41,7 +41,7 @@ TRAINING_MODELS = [
 ]
 
 MCP_CLIENTS = {
-    "hermes":     lambda: os.system("hermes mcp add localdistill --command 'python %s' 2>/dev/null" % (DIR/"mcp"/"mcp_server.py")),
+    "hermes":     lambda: subprocess.run("echo y | hermes mcp add localdistill --command python --args " + str(DIR/"mcp"/"mcp_server.py"), shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
     "claude-desktop": lambda: _write_mcp_json(Path.home()/"Library/Application Support/Claude/claude_desktop_config.json"),
     "claude-code":    lambda: _write_mcp_json(Path.home()/".claude"/"mcp.json"),
     "vscode":         lambda: _write_mcp_json(Path.home()/".vscode"/"mcp.json"),
@@ -233,7 +233,11 @@ def start_services():
 # ── step 6: MCP ──
 def configure_mcp():
     C.print("\n[bold][6/6] Configure MCP server[/]")
-    detected = [c for c in MCP_CLIENTS if c == "hermes" and subprocess.run(["which", "hermes"], capture_output=True).returncode == 0]
+    detected = []
+    if subprocess.run(["which", "hermes"], capture_output=True).returncode == 0:
+        detected.append("hermes")
+    if subprocess.run(["which", "claude"], capture_output=True).returncode == 0:
+        detected.append("claude-code")
     if not detected:
         C.print("  [dim]No MCP clients detected. Config:[/]")
         C.print(json.dumps(MCP_JSON, indent=2))
