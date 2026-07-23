@@ -157,6 +157,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Fast-path: everything already configured
+source .env 2>/dev/null || true
+if [[ -n "${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}${OPENROUTER_API_KEY:-}" ]] && \
+   [[ -n "${LOCALDISTILL_API_MODEL:-}" ]] && [[ -n "${LOCALDISTILL_MODEL:-}" ]]; then
+  echo ""
+  echo "  ${GREEN}${BOLD}Everything configured.${NC}"
+  echo "  ${DIM}─────────────────────────────────────────────────${NC}"
+  echo "    API model:   ${LOCALDISTILL_API_MODEL}"
+  echo "    Provider:    ${OPENAI_API_KEY:+OpenAI }${ANTHROPIC_API_KEY:+Anthropic }${OPENROUTER_API_KEY:+OpenRouter}"
+  echo "    Training:    ${LOCALDISTILL_MODEL}"
+  echo ""
+  printf "    ${CYAN}?${NC} Start services? ${DIM}[Y/n]${NC}: "; read -r go
+  [[ "$go" =~ ^[Nn] ]] && { echo "  Exiting."; exit 0; }
+  docker compose build proxy api 2>&1 | tail -1
+  docker compose up -d proxy api 2>&1 | tail -1
+  echo "  ${GREEN}✓${NC} Proxy: http://localhost:8787  Dashboard: http://localhost:8000"
+  exit 0
+fi
+
 # ═══════════════════════════════════════════════════════════════
 # Step 1: Prerequisites
 # ═══════════════════════════════════════════════════════════════
