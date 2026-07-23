@@ -33,7 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 STEP=0
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 HAS_GPU=false
 SKIP_BUILD=false
 SKIP_MCP=false
@@ -82,6 +82,7 @@ _prompt() {
 }
 
 _done_box() {
+  source .env 2>/dev/null || true
   echo ""
   echo "  ╔══════════════════════════════════════════════════════════╗"
   echo "  ║                    ${GREEN}${BOLD}LOCALDISTILL READY${NC}                   ║"
@@ -89,6 +90,7 @@ _done_box() {
   echo "  ║                                                          ║"
   printf "  ║  ${BOLD}Proxy:${NC}     http://localhost:8787${NC}                         ║\n"
   printf "  ║  ${BOLD}Dashboard:${NC} http://localhost:8000${NC}                         ║\n"
+  printf "  ║  ${BOLD}Model:${NC}      %-45s ${NC}║\n" "${LOCALDISTILL_MODEL:-unsloth/Llama-3.2-3B-Instruct}"
   echo "  ║                                                          ║"
   printf "  ║  ${BOLD}Train:${NC}         ./train.sh${NC}                                ║\n"
   printf "  ║  ${BOLD}Cloud train:${NC}   ./scripts/cloud_train.sh runpod${NC}          ║\n"
@@ -231,7 +233,118 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════
-# Step 3: Build images
+# Step 3: Select base model for training
+# ═══════════════════════════════════════════════════════════════
+
+_step "Selecting base model for fine-tuning"
+
+load_model() {
+  local name="$1" hf="$2" size="$3" tier="$4"
+  MODELS+=("$name")
+  MODEL_HF+=("$hf")
+  MODEL_SIZE+=("$size")
+  MODEL_TIER+=("$tier")
+}
+
+MODELS=(); MODEL_HF=(); MODEL_SIZE=(); MODEL_TIER=()
+
+load_model "Llama 3.2 3B Instruct"     "unsloth/Llama-3.2-3B-Instruct"     "3B"  "fast"
+load_model "Qwen 2.5 3B Instruct"       "unsloth/Qwen2.5-3B-Instruct"       "3B"  "fast"
+load_model "Phi-3.5 Mini Instruct"      "unsloth/Phi-3.5-mini-instruct"      "4B"  "fast"
+load_model "Mistral 7B Instruct v0.3"   "unsloth/Mistral-7B-Instruct-v0.3"   "7B"  "balanced"
+load_model "Llama 3.1 8B Instruct"      "unsloth/Llama-3.1-8B-Instruct"      "8B"  "balanced"
+load_model "Qwen 2.5 7B Instruct"       "unsloth/Qwen2.5-7B-Instruct"        "7B"  "balanced"
+load_model "Llama 3.3 70B Instruct"     "unsloth/Llama-3.3-70B-Instruct"     "70B" "cloud"
+
+# Load saved preference
+source .env 2>/dev/null || true
+CURRENT_MODEL="${LOCALDISTILL_MODEL:-}"
+
+echo ""
+echo "  ${BOLD}Recommended base models:${NC}"
+echo ""
+
+for i in "${!MODELS[@]}"; do
+  local tag=""
+  case "${MODEL_TIER[$i]}" in
+    fast)     tag="${GREEN}⚡ fast${NC}" ;;
+    balanced) tag="${CYAN}⚖ balanced${NC}" ;;
+    cloud)    tag="${YELLOW}☁ cloud${NC}" ;;
+  esac
+  local marker=" "
+  [[ "${MODEL_HF[$i]}" == "$CURRENT_MODEL" ]] && marker="${GREEN}▶${NC}"
+  printf "    ${GREEN}%d)${NC} %-35s ${DIM}%-5s${NC} %s\n" \
+    "$((i+1))" "${MODELS[$i]}" "${MODEL_SIZE[$i]}" "$tag"
+  [[ "${MODEL_HF[$i]}" == "$CURRENT_MODEL" ]] && \
+    printf "       ${DIM}↑ currently selected${NC}\n"
+done
+
+printf "    ${DIM}%d)${NC} Custom (enter HuggingFace model ID)\n" "$((${#MODELS[@]}+1))"
+echo ""
+
+# Determine default choice
+local default=1
+for i in "${!MODEL_HF[@]}"; do
+  [[ "${MODEL_HF[$i]}" == "$CURRENT_MODEL" ]] && default=$((i+1))
+done
+
+printf "    ${CYAN}?${NC} Select model ${DIM}[$default]${NC}: "
+read -r model_choice
+model_choice="${model_choice:-$default}"
+
+if [[ "$model_choice" -le "${#MODELS[@]}" ]] 2>/dev/null && [[ "$model_choice" -ge 1 ]]; then
+  SELECTED="${MODEL_HF[$((model_choice-1))]}"
+  SELECTED_NAME="${MODELS[$((model_choice-1))]}"
+  SELECTED_SIZE="${MODEL_SIZE[$((model_choice-1))]}"
+  SELECTED_TIER="${MODEL_TIER[$((model_choice-1))]}"
+elif [[ "$model_choice" -eq "$((${#MODELS[@]}+1))" ]] 2>/dev/null; then
+  printf "    ${CYAN}?${NC} HuggingFace model ID: "
+  read -r custom_model
+  SELECTED="$custom_model"
+  SELECTED_NAME="custom: $custom_model"
+  SELECTED_SIZE="?"
+  SELECTED_TIER="custom"
+else
+  SELECTED="${MODEL_HF[0]}"
+  SELECTED_NAME="${MODELS[0]}"
+  SELECTED_SIZE="${MODEL_SIZE[0]}"
+  SELECTED_TIER="${MODEL_TIER[0]}"
+  _warn "Invalid choice — defaulting to $SELECTED_NAME"
+fi
+
+# Save to .env
+sed -i "/^LOCALDISTILL_MODEL=/d" .env 2>/dev/null || true
+echo "LOCALDISTILL_MODEL=$SELECTED" >> .env
+
+# Handle cloud-tier warning
+if [[ "$SELECTED_TIER" == "cloud" ]]; then
+  _ok "$SELECTED_NAME (${SELECTED_SIZE}) — cloud training only"
+  _warn "70B model requires cloud GPU (A100 80GB). Use: ./scripts/cloud_train.sh"
+elif [[ "$SELECTED_TIER" == "fast" ]] && ! $HAS_GPU; then
+  _ok "$SELECTED_NAME (${SELECTED_SIZE})"
+  _warn "No local GPU detected. Model can still train via cloud: ./scripts/cloud_train.sh"
+else
+  _ok "$SELECTED_NAME (${SELECTED_SIZE})${DIM} — will train on ${NC}$($HAS_GPU && echo "local GPU" || echo "cloud")"
+fi
+
+# Offer to download model immediately via Ollama
+if command -v ollama &>/dev/null; then
+  echo ""
+  printf "    ${CYAN}?${NC} Download this model now with Ollama for local inference? ${DIM}[y/N]${NC}: "
+  read -r dl
+  if [[ "$dl" =~ ^[Yy]$ ]]; then
+    ollama_name=$(echo "$SELECTED" | sed 's|unsloth/||; s|/|:|')
+    echo ""
+    ollama pull "$ollama_name" 2>&1 &
+    _spinner $! "Downloading $ollama_name..."
+    _ok "Model pulled — ready for inference via ollama run $ollama_name"
+  fi
+else
+  _info "Ollama not installed — model will be downloaded during training"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# Step 4: Build images
 # ═══════════════════════════════════════════════════════════════
 
 _step "Building Docker images"

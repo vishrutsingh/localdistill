@@ -28,10 +28,19 @@ if ! nvidia-smi &>/dev/null; then
 fi
 
 echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+echo "  Base model: ${LOCALDISTILL_MODEL:-unsloth/Llama-3.2-3B-Instruct}"
 echo "  Available for training: $(python3 -c "from proxy.db import get_db; db=get_db(); r=db.execute('SELECT COUNT(*) as cnt FROM curated_training WHERE used_in_training=0').fetchone(); print(r['cnt']); db.close()" 2>/dev/null || echo "?") conversations"
 echo ""
 
-docker compose --profile training run --rm trainer "$@"
+# Pass saved model preference if no --base flag provided by user
+ARGS=("$@")
+HAS_BASE=false
+for a in "$@"; do [[ "$a" == "--base" ]] && HAS_BASE=true; done
+if ! $HAS_BASE && [[ -n "${LOCALDISTILL_MODEL:-}" ]]; then
+  ARGS+=(--base "$LOCALDISTILL_MODEL")
+fi
+
+docker compose --profile training run --rm trainer "${ARGS[@]}"
 
 echo ""
 echo "  Training complete. Adapter saved to ./adapters/"
