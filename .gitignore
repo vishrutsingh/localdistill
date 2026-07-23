@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+localdistill.db
+train.jsonl
+adapters/
+*.tar.gz
+.DS_Store

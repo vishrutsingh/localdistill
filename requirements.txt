@@ -1,0 +1,16 @@
+# localdistill — Phase 1 & 2
+litellm>=1.50.0
+sqlite-vec>=0.1.0
+numpy>=1.24.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+mcp>=1.0.0
+
+# Phase 3 — Training
+unsloth>=2026.1.0
+transformers>=4.40.0
+datasets>=2.14.0
+accelerate>=0.30.0
+peft>=0.10.0
+trl>=0.8.0
+torch>=2.1.0
