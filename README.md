@@ -39,16 +39,17 @@ Available slash commands/tools:
 
 ## Architecture
 
-```
-Your Tools → localdistill Proxy (:8787) → Real API (OpenAI/Claude)
-                      ↓
-                  SQLite DB
-                      ↓
-              ┌───────┴───────┐
-              ↓               ↓
-         MCP Server      Training Pipeline
-         (curation)      (Phase 3: LoRA)
-```
+![localdistill Architecture](diagrams/architecture.svg)
+
+### Prompt Lifecycle
+
+1. **Capture** — Hermes routes to `custom:localdistill` → Proxy :8787 logs every request/response to SQLite
+2. **Score** — 10 regex signal detectors run on each user message (hallucination, correction, acceptance, etc.)
+3. **Finalize** — Auto-finalizer computes quality score (base 0.60 ± signals ± structural bonuses) after 5-min idle timeout
+4. **Curate** — MCP tools or Dashboard override scores inline: auto-promote ≥ 0.70, auto-exclude ≤ 0.25
+5. **Export** — `dataset_exporter.py` queries `curated_training` table → ChatML / ShareGPT / Alpaca JSONL
+6. **Train** — `train.py` loads base model with Unsloth 4-bit, trains LoRA adapter, exports GGUF + Modelfile
+7. **Deploy** — LoRA adapter → Ollama for local inference, closing the feedback loop
 
 ## Files
 
