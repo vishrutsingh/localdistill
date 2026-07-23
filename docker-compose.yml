@@ -1,0 +1,55 @@
+services:
+  proxy:
+    build: ./proxy
+    container_name: localdistill-proxy
+    ports:
+      - "8787:8787"
+    volumes:
+      - data:/data
+      - ./proxy/db.py:/app/db.py:ro
+      - ./proxy/quality.py:/app/quality.py:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - LOCALDISTILL_DB_PATH=/data/localdistill.db
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    container_name: localdistill-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - data:/data
+      - ./proxy/db.py:/app/db.py:ro
+      - ./proxy/quality.py:/app/quality.py:ro
+      - ./trainer/dataset_exporter.py:/app/dataset_exporter.py:ro
+    environment:
+      - LOCALDISTILL_DB_PATH=/data/localdistill.db
+    restart: unless-stopped
+
+  trainer:
+    build: ./trainer
+    container_name: localdistill-trainer
+    profiles:
+      - training
+    volumes:
+      - data:/data
+      - ./adapters:/app/adapters
+    environment:
+      - LOCALDISTILL_DB_PATH=/data/localdistill.db
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
