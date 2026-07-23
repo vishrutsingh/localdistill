@@ -17,14 +17,14 @@ shopt -s inherit_errexit
 # ═══════════════════════════════════════════════════════════════
 
 if [[ -t 1 ]]; then
-  BOLD='\033[1m'
-  DIM='\033[2m'
-  GREEN='\033[32m'
-  YELLOW='\033[33m'
-  RED='\033[31m'
-  BLUE='\033[34m'
-  CYAN='\033[36m'
-  NC='\033[0m'
+  BOLD=$(tput bold 2>/dev/null || echo '')
+  DIM=$(tput dim 2>/dev/null || echo '')
+  GREEN=$(tput setaf 2 2>/dev/null || echo '')
+  YELLOW=$(tput setaf 3 2>/dev/null || echo '')
+  RED=$(tput setaf 1 2>/dev/null || echo '')
+  BLUE=$(tput setaf 4 2>/dev/null || echo '')
+  CYAN=$(tput setaf 6 2>/dev/null || echo '')
+  NC=$(tput sgr0 2>/dev/null || echo '')
 else
   BOLD='' DIM='' GREEN='' YELLOW='' RED='' BLUE='' CYAN='' NC=''
 fi
