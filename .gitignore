@@ -6,3 +6,6 @@ train.jsonl
 adapters/
 *.tar.gz
 .DS_Store
+unsloth_compiled_cache/
+*_train.jsonl
+.cache/

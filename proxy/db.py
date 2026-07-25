@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import os
-DB_PATH = Path(os.environ.get("LOCALDISTILL_DB_PATH", "~/localdistill/localdistill.db")).expanduser()
+DB_PATH = Path(os.environ.get("LOCALDISTILL_DB_PATH", "~/localdistill/data/localdistill.db")).expanduser()
 
 
 def get_db() -> sqlite3.Connection:

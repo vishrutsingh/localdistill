@@ -1,6 +1,8 @@
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+FROM unsloth/unsloth:latest
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY train.py dataset_exporter.py db.py quality.py ./
-ENTRYPOINT ["python", "train.py"]
+RUN pip install --no-cache-dir lm-eval requests
+COPY trainer/ /app/trainer/
+COPY proxy/db.py proxy/quality.py /app/
+COPY entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]

@@ -11,6 +11,13 @@ Usage:
   python train.py --dry-run            # Export dataset only, don't train
 """
 
+# ponytail: Python 3.13 pickle compat — fork avoids re-import identity mismatch
+import multiprocessing
+try:
+    multiprocessing.set_start_method('fork', force=True)
+except RuntimeError:
+    pass
+
 import sys
 import os
 import json
@@ -49,7 +56,8 @@ def check_gpu() -> Tuple[bool, str]:
     try:
         import torch
         if torch.cuda.is_available():
-            return True, f"CUDA GPU: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_mem // 1024**3} GB)"
+            mem = getattr(torch.cuda.get_device_properties(0), 'total_memory', getattr(torch.cuda.get_device_properties(0), 'total_mem', 0))
+            return True, f"CUDA GPU: {torch.cuda.get_device_name(0)} ({mem // 1024**3} GB)"
         elif torch.backends.mps.is_available():
             return True, "Apple MPS (Metal Performance Shaders)"
         else:
@@ -140,7 +148,7 @@ def train_lora(
             texts.append(text)
         return {"text": texts}
     
-    dataset = dataset.map(format_chatml, batched=True)
+    dataset = dataset.map(format_chatml, batched=True, num_proc=1)  # ponytail: 3.13 pickle
     
     # Training arguments
     adapter_dir = output_dir or str(OUTPUT_DIR / run_id[:8])
@@ -160,6 +168,8 @@ def train_lora(
         seed=42,
         output_dir=adapter_dir,
         report_to="none",
+        dataloader_num_workers=0,    # ponytail: Python 3.13 pickle compat
+        save_strategy="no",          # ponytail: checkpoint save triggers pickle
     )
     
     trainer = SFTTrainer(
@@ -168,7 +178,7 @@ def train_lora(
         train_dataset=dataset,
         dataset_text_field="text",
         max_seq_length=max_seq_length,
-        dataset_num_proc=2,
+        dataset_num_proc=1,   # ponytail: Python 3.13 pickle compat
         packing=False,
         args=training_args,
     )
@@ -177,7 +187,9 @@ def train_lora(
     trainer.train()
     
     # Save adapter
+    print("[localdistill] Saving model...", flush=True)
     model.save_pretrained(adapter_dir)
+    print("[localdistill] Saving tokenizer...", flush=True)
     tokenizer.save_pretrained(adapter_dir)
     print(f"[localdistill] Adapter saved to {adapter_dir}")
     
@@ -228,6 +240,42 @@ def _train_on_cloud(run_id, dataset_path, base_model, provider, *args) -> Tuple[
     return run_id, "(cloud)"
 
 
+# ponytail: global lock on proxy, per-account rate-limit if concurrent calls matter
+def _teacher_distill(db, teacher_model: str, n: int = 100, proxy_url: str = "http://localhost:8787/v1"):
+    """Sample N unused prompts, call teacher via proxy, inject responses as curated pairs."""
+    import requests
+    rows = db.execute(
+        "SELECT conversation_id, content FROM interactions WHERE role='user' AND conversation_id IN "
+        "(SELECT conversation_id FROM curated_training WHERE used_in_training=0) "
+        "ORDER BY RANDOM() LIMIT ?", (n,)
+    ).fetchall()
+    if not rows:
+        print("[localdistill] No unused prompts for teacher distillation")
+        return 0
+
+    added = 0
+    for row in rows:
+        try:
+            resp = requests.post(
+                f"{proxy_url}/chat/completions",
+                json={"model": teacher_model, "messages": [{"role": "user", "content": row["content"]}]},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                teacher_text = resp.json()["choices"][0]["message"]["content"]
+                cid = str(uuid.uuid4())
+                db.execute("INSERT INTO conversations (id,title,status,turn_count,created_at) VALUES (?,'on-policy','completed',2,datetime('now'))", (cid,))
+                db.execute("INSERT INTO interactions (id,conversation_id,turn_number,role,content,created_at) VALUES (?,?,1,'user',?,datetime('now'))", (str(uuid.uuid4()), cid, row["content"]))
+                db.execute("INSERT INTO interactions (id,conversation_id,turn_number,role,content,created_at) VALUES (?,?,2,'assistant',?,datetime('now'))", (str(uuid.uuid4()), cid, teacher_text))
+                db.execute("INSERT INTO curated_training (conversation_id,promoted_by,quality_score,format) VALUES (?,'teacher',0.90,'chatml')", (cid,))
+                added += 1
+        except Exception as e:
+            print(f"[localdistill] Teacher call failed: {e}")
+    db.commit()
+    print(f"[localdistill] Teacher distillation: {added}/{len(rows)} pairs injected")
+    return added
+
+
 def run_training_pipeline(
     base_model: str = DEFAULT_BASE_MODEL,
     min_score: float = 0.0,
@@ -235,6 +283,8 @@ def run_training_pipeline(
     cloud_provider: Optional[str] = None,
     dry_run: bool = False,
     mark_used: bool = True,
+    teacher_model: Optional[str] = None,
+    on_policy_rounds: int = 0,
 ) -> dict:
     """
     Full training pipeline: export → train → record → mark.
@@ -287,6 +337,7 @@ def run_training_pipeline(
             cloud_provider=cloud_provider,
         )
     except Exception as e:
+        import traceback; traceback.print_exc()
         db.execute(
             "UPDATE training_runs SET status = 'failed', error_log = ?, completed_at = ? WHERE id = ?",
             (str(e), datetime.now(timezone.utc).isoformat(), run_id)
@@ -316,6 +367,25 @@ def run_training_pipeline(
         (adapter_path, datetime.now(timezone.utc).isoformat(), run_id)
     )
     db.commit()
+
+    # Step 5: On-policy distillation rounds (if requested)
+    if on_policy_rounds > 0 and teacher_model:
+        for r in range(on_policy_rounds):
+            print(f"[localdistill] On-policy round {r+1}/{on_policy_rounds}")
+            added = _teacher_distill(db, teacher_model)
+            if added == 0:
+                break
+            # Re-export + re-train
+            count2 = export_dataset(str(DATASET_PATH), "chatml", max_examples=max_examples)
+            if count2 == 0:
+                break
+            try:
+                train_lora(str(DATASET_PATH), base_model, cloud_provider=cloud_provider)
+            except Exception as e:
+                print(f"[localdistill] On-policy round {r+1} failed: {e}")
+                break
+            db.execute("UPDATE training_runs SET num_examples = num_examples + ? WHERE id = ?", (added, run_id))
+            db.commit()
     db.close()
     
     result = {
@@ -341,6 +411,10 @@ if __name__ == "__main__":
                         help="Export dataset without training")
     parser.add_argument("--no-mark", action="store_true",
                         help="Don't mark examples as used after training")
+    parser.add_argument("--teacher-model", default=None,
+                        help="Teacher model for on-policy distillation (e.g. openrouter/deepseek/deepseek-v4-pro)")
+    parser.add_argument("--on-policy", type=int, default=0,
+                        help="Number of teacher distillation rounds after SFT")
     
     args = parser.parse_args()
     
@@ -351,6 +425,8 @@ if __name__ == "__main__":
         cloud_provider=args.cloud,
         dry_run=args.dry_run,
         mark_used=not args.no_mark,
+        teacher_model=args.teacher_model,
+        on_policy_rounds=args.on_policy,
     )
     
     print(f"\n{'='*50}")

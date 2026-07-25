@@ -19,43 +19,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "proxy"))
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from db import get_db, get_conversation, get_unreviewed_conversations
 from quality import AUTO_PROMOTE_THRESHOLD, should_auto_promote, should_auto_exclude
 
-from fastapi.responses import HTMLResponse
+import os
 
 app = FastAPI(title="localdistill-api")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html><head><title>localdistill</title><meta charset="utf-8"><meta http-equiv="refresh" content="10">
-<style>body{font:14px monospace;background:#111;color:#eee;padding:2em;max-width:700px;margin:auto}
-h1{color:#0f0}h3{color:#aaa;margin-top:2em}table{width:100%;border-collapse:collapse}td,th{padding:8px 12px;text-align:left;border-bottom:1px solid #333}
-.green{color:#0f0}.yellow{color:#cc0}.dim{color:#666}.bar{height:4px;background:#333;margin:4px 0}.bar div{height:100%;background:#0f0}</style></head>
-<body><h1>localdistill</h1><div id="status">Loading...</div>
-<script>
-fetch('/api/status').then(r=>r.json()).then(d=>{
-  let h='<h3>Proxy</h3><p class="green">'+d.proxy+'</p>';
-  h+='<h3>Conversations</h3><p>Total: <b>'+d.total_conversations+'</b> | Curated: <b class="green">'+d.curated_count+'</b></p>';
-  h+='<div class="bar"><div style="width:'+Math.min(100,d.curated_count*10)+'%"></div></div>';
-  h+='<p class="dim">Quality threshold: '+d.auto_promote_threshold+' (auto-promote)</p>';
-  h+='<h3>Training</h3><p>Runs: <b>'+d.training_runs+'</b> | Status: <b class="yellow">'+d.training_status+'</b></p>';
-  h+='<p class="dim">Model: '+d.model+'</p>';
-  h+='<p class="dim">Run: <code>./train.sh</code></p>';
-  h+='<h3>Recent</h3><table>'+d.recent.map(r=>'<tr><td class="dim">#'+r.id+'</td><td>'+r.model+'</td><td class="'+(r.score>=0.7?'green':'yellow')+'">'+r.score.toFixed(2)+'</td><td class="dim">'+r.status+'</td></tr>').join('')+'</table>';
-  document.getElementById('status').innerHTML=h;
-});
-</script></body></html>"""
-
-@app.get("/")
-async def root():
-    return HTMLResponse(DASHBOARD_HTML)
-
-DATA_DIR = Path("/data")
-
 
 @app.get("/health")
 async def health():
@@ -166,21 +140,93 @@ async def search(q: str = Query(..., min_length=2), limit: int = Query(5, le=20)
     return {"query": q, "results": [dict(r) for r in rows]}
 
 
+@app.get("/api/conversations/{conv_id}/signals")
+async def get_signals(conv_id: str):
+    db = get_db()
+    signals = db.execute(
+        "SELECT * FROM conversation_signals WHERE conversation_id = ? ORDER BY created_at",
+        (conv_id,)
+    ).fetchall()
+    db.close()
+    return {"conversation_id": conv_id, "signals": [dict(s) for s in signals]}
+
+
+@app.get("/api/stats")
+async def get_stats():
+    db = get_db()
+    # Score distribution
+    buckets = db.execute("""
+        SELECT
+            CASE WHEN quality_score < 0.25 THEN '0.00-0.25'
+                 WHEN quality_score < 0.50 THEN '0.25-0.50'
+                 WHEN quality_score < 0.70 THEN '0.50-0.70'
+                 WHEN quality_score < 0.85 THEN '0.70-0.85'
+                 ELSE '0.85-1.00' END as bucket,
+            COUNT(*) as cnt
+        FROM conversations WHERE quality_score IS NOT NULL
+        GROUP BY bucket ORDER BY bucket
+    """).fetchall()
+    # Conversations per day
+    per_day = db.execute("""
+        SELECT date(created_at) as day, COUNT(*) as cnt
+        FROM conversations
+        GROUP BY day ORDER BY day
+    """).fetchall()
+    # Signal type counts
+    signal_counts = db.execute("""
+        SELECT signal_type, COUNT(*) as cnt
+        FROM conversation_signals
+        GROUP BY signal_type ORDER BY cnt DESC
+    """).fetchall()
+    total = db.execute("SELECT COUNT(*) as cnt FROM conversations").fetchone()["cnt"]
+    curated = db.execute("SELECT COUNT(*) as cnt FROM curated_training").fetchone()["cnt"]
+    db.close()
+    return {
+        "total": total,
+        "curated": curated,
+        "score_distribution": [dict(r) for r in buckets],
+        "conversations_per_day": [dict(r) for r in per_day],
+        "signal_counts": [dict(r) for r in signal_counts],
+    }
+
+
+@app.get("/api/training")
+async def get_training():
+    db = get_db()
+    runs = db.execute(
+        "SELECT * FROM training_runs ORDER BY created_at DESC LIMIT 20"
+    ).fetchall()
+    pending = db.execute(
+        "SELECT COUNT(*) as cnt FROM curated_training WHERE used_in_training = 0"
+    ).fetchone()["cnt"]
+    db.close()
+    return {
+        "runs": [dict(r) for r in runs],
+        "pending_curated": pending,
+    }
+
+
 @app.get("/api/export")
 async def export_dataset(fmt: str = Query("chatml", regex="^(chatml|sharegpt|alpaca)$")):
     sys.path.insert(0, str(Path(__file__).parent.parent / "trainer"))
     from dataset_exporter import export_dataset
-    
+
     tmpfile = f"/tmp/localdistill_export_{fmt}.jsonl"
     count = export_dataset(output_path=tmpfile, fmt=fmt, exclude_used=False)
     if count == 0:
         raise HTTPException(status_code=404, detail="No curated conversations")
-    
+
     with open(tmpfile) as f:
         content = f.read()
-    
+
     return PlainTextResponse(content=content, media_type="application/x-ndjson",
                              headers={"Content-Disposition": f"attachment; filename=train.{fmt}.jsonl"})
+
+
+# Mount dashboard static files at / (after all API routes so they take priority)
+dashboard_dir = Path(__file__).parent / "dashboard"
+if dashboard_dir.exists():
+    app.mount("/", StaticFiles(directory=str(dashboard_dir), html=True), name="dashboard")
 
 
 if __name__ == "__main__":

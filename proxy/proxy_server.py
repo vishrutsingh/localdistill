@@ -95,9 +95,14 @@ async def chat_completions(request: Request):
     # ── Route to real API ──
     start_time = time.time()
     try:
+        # Route through OpenRouter if key is set and model isn't already prefixed
+        route_model = model
+        if os.environ.get("OPENROUTER_API_KEY") and not model.startswith("openrouter/"):
+            route_model = f"openrouter/{model}"
+        
         # Use litellm for multi-provider routing
         litellm_params = {
-            "model": model,
+            "model": route_model,
             "messages": messages,
         }
         
