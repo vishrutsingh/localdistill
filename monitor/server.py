@@ -648,10 +648,16 @@ async def health():
 
 def main():
     """Run the monitor server."""
+    import signal
+    
     port = int(os.environ.get("MONITOR_PORT", 8080))
     host = os.environ.get("MONITOR_HOST", "0.0.0.0")
     
-    uvicorn.run(app, host=host, port=port)
+    # Handle Ctrl+C gracefully
+    signal.signal(signal.SIGINT, lambda s, f: exit(0))
+    signal.signal(signal.SIGTERM, lambda s, f: exit(0))
+    
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
