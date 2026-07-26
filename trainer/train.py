@@ -66,6 +66,46 @@ def check_gpu() -> Tuple[bool, str]:
         return False, "PyTorch not installed"
 
 
+# ── JSON Log Writer for Dashboard ──
+LOG_DIR = Path("~/localdistill/logs/runs").expanduser()
+
+def _write_training_event(run_id: str, stage: str, message: str, level: str = "INFO", **data):
+    """Write a structured log event for dashboard consumption."""
+    run_dir = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}_{run_id[:8]}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "stage": stage,
+        "message": message,
+        "run_id": run_id,
+        "data": data,
+    }
+    
+    # Append to events.jsonl
+    with open(run_dir / "events.jsonl", "a") as f:
+        f.write(json.dumps(event) + "\n")
+    
+    # Append to run.log (human readable)
+    with open(run_dir / "run.log", "a") as f:
+        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{level}] [{stage}] {message}\n")
+    
+    # Update status.json
+    status = {
+        "run_id": run_id,
+        "stage": stage,
+        "started_at": event["timestamp"],
+        "completed_at": None if stage not in ("complete", "failed") else event["timestamp"],
+        "progress": data.get("progress", 0),
+        "current_step": data.get("step", ""),
+        "metrics": {k: v for k, v in data.items() if k in ("loss", "lr", "epoch", "step")},
+        "error": data.get("error"),
+    }
+    with open(run_dir / "status.json", "w") as f:
+        json.dump(status, f, indent=2)
+
+
 def train_lora(
     dataset_path: str,
     base_model: str = DEFAULT_BASE_MODEL,
@@ -106,8 +146,37 @@ def train_lora(
     from datasets import load_dataset
     from transformers import TrainingArguments
     from trl import SFTTrainer
+    from transformers import TrainerCallback
+    
+    # ── Logging Callback for Dashboard ──
+    class DashboardCallback(TrainerCallback):
+        """Writes training metrics to JSON log for dashboard."""
+        def __init__(self, run_id, total_steps):
+            self.run_id = run_id
+            self.total_steps = total_steps
+        
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs and "loss" in logs:
+                progress = (state.global_step / self.total_steps * 100) if self.total_steps else 0
+                _write_training_event(
+                    self.run_id, "train",
+                    f"Step {state.global_step}: loss={logs['loss']:.4f}",
+                    level="DEBUG",
+                    step=state.global_step,
+                    loss=logs["loss"],
+                    lr=logs.get("learning_rate", 0),
+                    epoch=logs.get("epoch", 0),
+                    progress=progress,
+                )
+        
+        def on_train_begin(self, args, state, control, **kwargs):
+            _write_training_event(self.run_id, "train", "Training started", level="INFO")
+        
+        def on_train_end(self, args, state, control, **kwargs):
+            _write_training_event(self.run_id, "train", "Training completed", level="SUCCESS", progress=100)
     
     # Load model with 4-bit quantization
+    _write_training_event(run_id, "init", f"Loading model: {base_model}", level="INFO")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=base_model,
         max_seq_length=max_seq_length,
@@ -137,6 +206,7 @@ def train_lora(
         raise ValueError(f"Unknown dataset format: {dataset_path}")
     
     print(f"[localdistill] Dataset: {len(dataset)} examples")
+    _write_training_event(run_id, "curate", f"Dataset loaded: {len(dataset)} examples", level="INFO", examples=len(dataset))
     
     # ChatML formatting function
     def format_chatml(examples):
@@ -172,6 +242,9 @@ def train_lora(
         save_strategy="no",          # ponytail: checkpoint save triggers pickle
     )
     
+    # Calculate total steps for progress tracking
+    total_steps = (len(dataset) // training_args.per_device_train_batch_size // training_args.gradient_accumulation_steps) * num_epochs
+    
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -181,6 +254,7 @@ def train_lora(
         dataset_num_proc=1,   # ponytail: Python 3.13 pickle compat
         packing=False,
         args=training_args,
+        callbacks=[DashboardCallback(run_id, total_steps)],
     )
     
     print(f"[localdistill] Starting training ({len(dataset)} examples, {num_epochs} epochs)...")
@@ -192,6 +266,7 @@ def train_lora(
     print("[localdistill] Saving tokenizer...", flush=True)
     tokenizer.save_pretrained(adapter_dir)
     print(f"[localdistill] Adapter saved to {adapter_dir}")
+    _write_training_event(run_id, "deploy", f"Adapter saved to {adapter_dir}", level="SUCCESS")
     
     # Export to GGUF for Ollama (optional)
     _export_gguf(model, tokenizer, adapter_dir)

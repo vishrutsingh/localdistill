@@ -18,7 +18,7 @@ def main():
     tasks = [t.strip() for t in args.tasks.split(",")]
 
     print(f"Eval: {adapter} on {tasks}")
-    model = HFLM(pretrained="unsloth/Llama-3.2-3B-Instruct", peft=adapter, batch_size="auto", trust_remote_code=True, device="cuda")
+    model = HFLM(pretrained="unsloth/Llama-3.2-3B-Instruct", peft=adapter, batch_size="auto", trust_remote_code=True, device="cpu")
     results = simple_evaluate(model=model, tasks=tasks, limit=args.limit, batch_size="auto")
 
     for task, info in results.get("results", {}).items():

@@ -1,52 +1,74 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# LocalDistill Docker Compose
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Services:
+#   - monitor:  Dashboard for monitoring pipeline runs (port 8080)
+#   - trainer:  GPU-enabled training container
+#   - api:      REST API for data access (port 8000)
+#   - proxy:    API proxy for capture mode (port 8787) [optional]
+#
+# Usage:
+#   # Start monitor dashboard only
+#   docker compose up monitor
+#
+#   # Run training pipeline (demo mode - fast)
+#   docker compose run --rm trainer python distill.py run --mode demo
+#
+#   # Run training pipeline (full mode)
+#   docker compose run --rm trainer python distill.py run --mode full
+#
+#   # Start everything including proxy (capture mode)
+#   docker compose --profile capture up
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
 services:
-  proxy:
-    build: ./proxy
-    container_name: localdistill-proxy
+  # ── Monitor Dashboard ─────────────────────────────────────────────────────────
+  # Web UI for monitoring pipeline runs, viewing logs, and tracking adapters
+  monitor:
+    build: ./monitor
+    container_name: localdistill-monitor
     ports:
-      - "8787:8787"
+      - "8080:8080"
     volumes:
-      - data:/data
-      - ./proxy/db.py:/app/db.py:ro
-      - ./proxy/quality.py:/app/quality.py:ro
+      - ./logs:/data/logs:ro
+      - ./adapters:/data/adapters:ro
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - LOCALDISTILL_DB_PATH=/data/localdistill.db
+      - MONITOR_PORT=8080
+      - LOCALDISTILL_LOGS_DIR=/data/logs
+      - LOCALDISTILL_ADAPTERS_DIR=/data/adapters
+      - MONITOR_REFRESH_INTERVAL=5
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
-  api:
-    build: ./api
-    container_name: localdistill-api
-    ports:
-      - "8000:8000"
-    volumes:
-      - data:/data
-      - ./proxy/db.py:/app/db.py:ro
-      - ./proxy/quality.py:/app/quality.py:ro
-      - ./trainer/dataset_exporter.py:/app/dataset_exporter.py:ro
-    environment:
-      - LOCALDISTILL_DB_PATH=/data/localdistill.db
-    restart: unless-stopped
-
+  # ── Trainer (GPU) ─────────────────────────────────────────────────────────────
+  # Main training container with Unsloth, runs the distillation pipeline
   trainer:
-    build: ./trainer
+    build:
+      context: .
+      dockerfile: Dockerfile.trainer
     container_name: localdistill-trainer
-    profiles:
-      - training
     volumes:
-      - data:/data
+      # Data and outputs
+      - ./data:/data
+      - ./logs:/app/logs
       - ./adapters:/app/adapters
-      - ./entrypoint.sh:/app/entrypoint.sh:ro
+      # Config and source
+      - ./config.yaml:/app/config.yaml:ro
+      - ./curated_train.jsonl:/app/curated_train.jsonl:ro
+      # HuggingFace cache (persist downloads)
       - ./.cache/huggingface:/root/.cache/huggingface
     environment:
       - LOCALDISTILL_DB_PATH=/data/localdistill.db
-      - BASE_MODEL=${BASE_MODEL:-unsloth/Llama-3.2-3B-Instruct}
-      - MAX_EXAMPLES=${MAX_EXAMPLES:-300}
-      - TEACHER_MODEL=${TEACHER_MODEL:-}
-      - ON_POLICY=${ON_POLICY:-0}
-      - BENCH_TASKS=${BENCH_TASKS:-gsm8k}
-      - BENCH_LIMIT=${BENCH_LIMIT:-10}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - HF_HOME=/root/.cache/huggingface
     deploy:
       resources:
         reservations:
@@ -54,8 +76,53 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    # Default command: show help
+    command: ["python", "distill.py", "--help"]
 
+  # ── API Server ────────────────────────────────────────────────────────────────
+  # REST API for accessing training data and exporting datasets
+  api:
+    build: ./api
+    container_name: localdistill-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - ./proxy/db.py:/app/db.py:ro
+      - ./proxy/quality.py:/app/quality.py:ro
+      - ./trainer/dataset_exporter.py:/app/dataset_exporter.py:ro
+    environment:
+      - LOCALDISTILL_DB_PATH=/data/localdistill.db
+    restart: unless-stopped
+    profiles:
+      - api
+      - full
+
+  # ── Proxy Server (Capture Mode) ───────────────────────────────────────────────
+  # API proxy that captures conversations for training data
+  proxy:
+    build: ./proxy
+    container_name: localdistill-proxy
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+      - ./proxy/db.py:/app/db.py:ro
+      - ./proxy/quality.py:/app/quality.py:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - LOCALDISTILL_DB_PATH=/data/localdistill.db
+    restart: unless-stopped
+    profiles:
+      - capture
+      - full
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:
+  # Bind mount for data directory (SQLite DB, etc.)
   data:
     driver: local
     driver_opts:

@@ -1,11 +1,88 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# LocalDistill .gitignore
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Environment & Secrets ─────────────────────────────────────────────────────
 .env
+.env.local
+*.pem
+*.key
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
-localdistill.db
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ── Data & Models (large files) ───────────────────────────────────────────────
+# Training datasets (keep curated_train.jsonl as it's pre-built)
 train.jsonl
+test_train.jsonl
+
+# Trained adapters (generated outputs)
 adapters/
-*.tar.gz
-.DS_Store
-unsloth_compiled_cache/
-*_train.jsonl
+
+# Database
+data/localdistill.db
+localdistill.db
+*.db
+
+# HuggingFace cache
 .cache/
+*.safetensors
+*.bin
+*.gguf
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/runs/
+logs/*.log
+*.log
+
+# ── Build & Cache ─────────────────────────────────────────────────────────────
+unsloth_compiled_cache/
+.unsloth/
+*.tar.gz
+*.zip
+
+# ── IDE & System ──────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-*
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Don't ignore docker-compose.yml or Dockerfiles
+
+# ── Temporary ─────────────────────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ── Keep these (negative patterns) ────────────────────────────────────────────
+!curated_train.jsonl
+!.env.example
+!logs/.gitkeep
+!adapters/.gitkeep
+!data/.gitkeep

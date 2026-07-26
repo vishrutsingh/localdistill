@@ -1,0 +1,191 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# LocalDistill Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# 
+# This file controls the entire distillation pipeline.
+# Copy to config.yaml and modify as needed.
+#
+# Quick start (fast demo):
+#   docker compose --profile demo up
+#
+# Full training:
+#   docker compose --profile train up
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Run Mode ──────────────────────────────────────────────────────────────────
+# demo:    Fast test run with minimal examples (default: 50 examples, 1 epoch)
+# full:    Full training run with all configured examples
+# custom:  Use exact settings from this config
+run_mode: demo
+
+# ── Data Source ───────────────────────────────────────────────────────────────
+dataset:
+  # Source type: file | huggingface
+  source: file
+  
+  # For source: file
+  path: ./curated_train.jsonl
+  
+  # For source: huggingface
+  huggingface:
+    dataset_id: RyokoAI/ShareGPT52K
+    split: train
+    # Optional: subset/config name
+    config: null
+    # Conversation field mapping (for non-standard datasets)
+    field_mapping:
+      conversations: conversations  # Field containing conversation turns
+      role_field: from              # Field for role (human/gpt)
+      content_field: value          # Field for message content
+      human_role: human             # Value indicating human turn
+      assistant_role: gpt           # Value indicating assistant turn
+  
+  # Format of the data: chatml | sharegpt | alpaca
+  format: chatml
+
+# ── Models ────────────────────────────────────────────────────────────────────
+models:
+  # Student model (the one being fine-tuned)
+  student: unsloth/Llama-3.2-3B-Instruct
+  
+  # Teacher model (for on-policy distillation)
+  # Use OpenRouter format: openrouter/<provider>/<model>
+  # Or direct: openai/gpt-4o, anthropic/claude-3-sonnet, etc.
+  teacher: openrouter/qwen/qwen-2.5-7b-instruct
+
+# ── Curation Settings ─────────────────────────────────────────────────────────
+curation:
+  # Minimum quality score (0.0 - 1.0) to include in training
+  min_quality_score: 0.0
+  
+  # Maximum examples to use (null = use all available)
+  max_examples: null
+  
+  # Filters
+  filters:
+    min_turns: 2                # Minimum conversation turns
+    max_turns: 50               # Maximum conversation turns
+    min_chars: 100              # Minimum total characters
+    max_chars: 50000            # Maximum total characters
+    exclude_code_heavy: false   # Skip responses with >80% code blocks
+
+# ── Training Configuration ────────────────────────────────────────────────────
+training:
+  # LoRA configuration
+  lora:
+    rank: 16                    # LoRA rank (higher = more capacity, more VRAM)
+    alpha: 32                   # LoRA alpha (typically 2x rank)
+    dropout: 0                  # LoRA dropout
+    target_modules:             # Modules to apply LoRA to
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+  
+  # Training hyperparameters
+  hyperparams:
+    learning_rate: 2.0e-4
+    epochs: 3
+    batch_size: 2
+    gradient_accumulation_steps: 4
+    max_seq_length: 2048
+    warmup_steps: 5
+    weight_decay: 0.01
+    lr_scheduler: linear        # linear | cosine | constant
+    seed: 42
+  
+  # Quantization: 4bit | 8bit | none
+  quantization: 4bit
+  
+  # Save checkpoints during training
+  save_checkpoints: false
+  checkpoint_steps: 100
+
+# ── On-Policy Distillation (ReOPD) ────────────────────────────────────────────
+# Two-phase offline distillation:
+#   Phase 1: Collect teacher trajectories (one-time, cached)
+#   Phase 2: Train with step-decay weighting (no API calls)
+on_policy:
+  enabled: false
+  teacher_query_interval: 10    # Controls decay: kappa = 1 - 1/interval
+  decay_function: exponential   # exponential (w_t = kappa^t) | linear
+  exponential_lambda: 0.9       # Direct kappa override (if decay_function=exponential)
+
+# ── Benchmarking ──────────────────────────────────────────────────────────────
+benchmark:
+  enabled: true
+  tasks:
+    - gsm8k                     # Math reasoning
+    # - mmlu                    # General knowledge (slow)
+    # - hellaswag              # Commonsense
+    # - truthfulqa             # Truthfulness
+  limit: 50                     # Examples per task (null = full eval)
+  compare_base: true            # Also benchmark base model for comparison
+  device: auto                  # auto | cpu | cuda (cpu fallback for low VRAM)
+
+# ── Deployment ────────────────────────────────────────────────────────────────
+deploy:
+  # GGUF export for Ollama/llama.cpp
+  gguf:
+    enabled: true
+    quantization: q4_k_m        # q4_k_m | q5_k_m | q8_0 | f16
+  
+  # Ollama registration
+  ollama:
+    enabled: false              # Set true if Ollama is installed
+    model_name: localdistill    # Name for `ollama run <name>`
+    auto_register: true         # Run `ollama create` automatically
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level: INFO                   # DEBUG | INFO | WARNING | ERROR
+  dir: ./logs
+  
+  # Log rotation
+  max_run_logs: 20              # Keep last N run directories
+  
+  # Console output
+  console:
+    enabled: true
+    colors: true
+    progress_bars: true
+  
+  # Training metrics
+  metrics:
+    log_every_n_steps: 1
+    include_loss: true
+    include_lr: true
+    include_grad_norm: false
+
+# ── Monitor Dashboard ─────────────────────────────────────────────────────────
+monitor:
+  enabled: true
+  port: 8080
+  # Auto-refresh interval in seconds
+  refresh_interval: 5
+
+# ── Presets (override settings for run_mode) ──────────────────────────────────
+presets:
+  demo:
+    curation:
+      max_examples: 50
+    training:
+      hyperparams:
+        epochs: 1
+    benchmark:
+      limit: 10
+    on_policy:
+      enabled: false
+  
+  full:
+    curation:
+      max_examples: 5000
+    training:
+      hyperparams:
+        epochs: 3
+    benchmark:
+      limit: 100

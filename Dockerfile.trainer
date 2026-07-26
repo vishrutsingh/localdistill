@@ -1,0 +1,51 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# LocalDistill Trainer Dockerfile
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# GPU-enabled container with Unsloth for LoRA training.
+# Includes the full pipeline: curate -> train -> benchmark -> deploy
+#
+# Build:
+#   docker build -f Dockerfile.trainer -t localdistill-trainer .
+#
+# Run:
+#   docker run --gpus all -v ./config.yaml:/app/config.yaml localdistill-trainer \
+#       python distill.py run --mode demo
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FROM unsloth/unsloth:latest
+
+WORKDIR /app
+
+# Install additional dependencies
+RUN pip install --no-cache-dir \
+    lm-eval \
+    requests \
+    pyyaml \
+    datasets
+
+# Copy library code
+COPY lib/ /app/lib/
+
+# Copy trainer code
+COPY trainer/ /app/trainer/
+
+# Copy main orchestrator
+COPY distill.py /app/
+
+# Copy config (will be overwritten by volume mount)
+COPY config.yaml /app/config.yaml
+
+# Copy dataset file (will be overwritten by volume mount)  
+COPY curated_train.jsonl /app/curated_train.jsonl
+
+# Create directories (volumes mount over these at runtime)
+RUN mkdir -p /app/logs /app/adapters
+
+# Set environment
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# Default: show help
+CMD ["python", "distill.py", "--help"]

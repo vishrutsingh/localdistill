@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# LocalDistill CLI - Local-first, simple
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()    { echo -e "${BLUE}[distill]${NC} $1"; }
+log_success() { echo -e "${GREEN}[distill]${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}[distill]${NC} $1"; }
+log_error()   { echo -e "${RED}[distill]${NC} $1"; }
+
+check_python() {
+    command -v python3 &>/dev/null
+}
+
+check_gpu() {
+    python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null
+}
+
+install_deps() {
+    log_info "Checking dependencies..."
+    
+    # Check torch
+    if ! python3 -c "import torch" 2>/dev/null; then
+        log_warn "Installing PyTorch..."
+        pip install torch --quiet
+    fi
+    
+    # Check unsloth
+    if ! python3 -c "import unsloth" 2>/dev/null; then
+        log_warn "Installing Unsloth..."
+        pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git" --quiet
+    fi
+    
+    # Check other deps
+    if ! python3 -c "import datasets; import yaml" 2>/dev/null; then
+        log_warn "Installing datasets, pyyaml..."
+        pip install datasets pyyaml --quiet
+    fi
+    
+    # Check fastapi for monitor
+    if ! python3 -c "import fastapi; import uvicorn" 2>/dev/null; then
+        log_warn "Installing FastAPI for monitor..."
+        pip install fastapi uvicorn --quiet
+    fi
+    
+    log_success "Dependencies OK"
+}
+
+cmd_run() {
+    echo ""
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║         LOCALDISTILL PIPELINE            ║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo ""
+    
+    if ! check_python; then
+        log_error "Python 3 not found. Install Python 3.10+"
+        exit 1
+    fi
+    
+    install_deps
+    
+    if check_gpu; then
+        GPU_NAME=$(python3 -c "import torch; print(torch.cuda.get_device_name(0))" 2>/dev/null)
+        log_success "GPU: $GPU_NAME"
+    else
+        log_warn "No GPU detected. Training will be SLOW."
+    fi
+    
+    echo ""
+    python3 distill.py run "$@"
+}
+
+cmd_monitor() {
+    log_info "Starting local monitor dashboard..."
+    
+    if ! check_python; then
+        log_error "Python 3 not found"
+        exit 1
+    fi
+    
+    # Install deps if needed
+    if ! python3 -c "import fastapi; import uvicorn" 2>/dev/null; then
+        log_warn "Installing FastAPI..."
+        pip install fastapi uvicorn --quiet
+    fi
+    
+    FG=""
+    PORT="8080"
+    for arg in "$@"; do
+        [[ "$arg" == "--fg" ]] && FG="1"
+        [[ "$arg" =~ ^--port= ]] && PORT="${arg#--port=}"
+    done
+    
+    if [[ -n "$FG" ]]; then
+        python3 monitor/server.py
+    else
+        # Run in background
+        MONITOR_PORT=$PORT python3 monitor/server.py &
+        MONITOR_PID=$!
+        echo $MONITOR_PID > .monitor.pid
+        sleep 1
+        if kill -0 $MONITOR_PID 2>/dev/null; then
+            log_success "Monitor running at http://localhost:$PORT"
+            log_info "Stop with: ./distill stop"
+        else
+            log_error "Monitor failed to start"
+            exit 1
+        fi
+    fi
+}
+
+cmd_stop() {
+    if [[ -f .monitor.pid ]]; then
+        PID=$(cat .monitor.pid)
+        if kill -0 $PID 2>/dev/null; then
+            kill $PID
+            log_success "Monitor stopped"
+        fi
+        rm -f .monitor.pid
+    else
+        log_info "No monitor running"
+    fi
+}
+
+cmd_status() {
+    python3 distill.py status "$@"
+}
+
+cmd_logs() {
+    python3 distill.py logs "$@"
+}
+
+cmd_setup() {
+    echo ""
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║         LOCALDISTILL SETUP               ║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo ""
+    
+    # Python
+    if check_python; then
+        log_success "Python: $(python3 --version 2>&1)"
+    else
+        log_error "Python 3 not found"
+        exit 1
+    fi
+    
+    # GPU
+    if check_gpu; then
+        GPU_NAME=$(python3 -c "import torch; print(torch.cuda.get_device_name(0))" 2>/dev/null)
+        GPU_MEM=$(python3 -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memory // 1024**3} GB')" 2>/dev/null)
+        log_success "GPU: $GPU_NAME ($GPU_MEM)"
+    else
+        log_warn "No GPU detected (training will be slow)"
+    fi
+    
+    # Deps
+    install_deps
+    
+    echo ""
+    log_success "Ready! Run: ./distill run --mode demo"
+}
+
+cmd_help() {
+    cat << 'EOF'
+
+  LocalDistill CLI
+  ================
+
+  COMMANDS:
+    setup               Check environment, install dependencies
+    run [--mode demo]   Run training pipeline
+    monitor [--fg]      Start dashboard at localhost:8080
+    stop                Stop monitor
+    status              Show recent runs
+    logs                Show latest logs
+
+  EXAMPLES:
+    ./distill setup                  # First time setup
+    ./distill run --mode demo        # Quick test (50 examples, ~5 min)
+    ./distill run --mode full        # Full training (5000 examples)
+    ./distill monitor                # Start dashboard
+
+EOF
+}
+
+# Main
+mkdir -p logs adapters data
+
+case "${1:-help}" in
+    setup)   shift; cmd_setup "$@" ;;
+    run)     shift; cmd_run "$@" ;;
+    monitor) shift; cmd_monitor "$@" ;;
+    stop)    shift; cmd_stop "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    logs)    shift; cmd_logs "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *) log_error "Unknown: $1"; cmd_help; exit 1 ;;
+esac
