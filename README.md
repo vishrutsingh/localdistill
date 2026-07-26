@@ -11,7 +11,7 @@
 │   ┌─────────────────────────────────────────────────────────────────────┐  │
 │   │                    LOCALDISTILL PIPELINE                            │  │
 │   │                                                                     │  │
-│   │   [Curate] ──▶ [Train] ──▶ [On-Policy] ──▶ [Benchmark] ──▶ [Deploy] │  │
+│   │   [Curate] ──▶ [Train] ──▶ [Evaluate] ──▶ [Deploy]                  │  │
 │   │                                                                     │  │
 │   └─────────────────────────────────────────────────────────────────────┘  │
 │                         │                                                   │
@@ -20,6 +20,78 @@
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Current Plan (Proof of Concept)
+
+**Goal:** Prove the distillation pipeline works before building full user-facing proxy.
+
+**Target user:** Business running ~10k LLM queries/day who wants to reduce cost by training a local model on their usage patterns.
+
+### Approach
+
+1. **Dataset:** `HuggingFaceH4/ultrafeedback_binarized` (GPT-4 scored quality preferences)
+2. **Split:** 90% train / 10% holdout
+3. **Train:** SFT student (Llama 3.2 3B) on "chosen" responses only
+4. **Evaluate:** On holdout set, compare student output vs chosen response
+5. **Success criteria:** Student wins or ties >60% of the time vs base model
+
+### Why this approach
+
+- **Not using Anthropic hh-rlhf:** That dataset is about safety/refusals, not response quality
+- **Not using lmsys/chatbot_arena:** Gated dataset, requires authentication
+- **Single training round first:** If one round doesn't improve the model, multiple rounds won't save it
+
+### Implementation Status
+
+| Component | Status |
+|-----------|--------|
+| Dataset loader for preference format | DONE |
+| Train/holdout split | DONE |
+| SFT training | DONE |
+| Checkpointing | DONE |
+| Evaluation (student vs chosen) | DONE |
+| LLM judge | TODO (using heuristic) |
+
+### Running the PoC
+
+```bash
+# Full pipeline (curate -> train -> evaluate)
+./distill run --mode preference
+
+# Or step by step
+./distill run --mode preference --steps curate
+./distill run --mode preference --steps train
+./distill run --mode preference --steps evaluate
+
+# With more examples (default 1000)
+./distill run --mode preference --max-examples 5000
+```
+
+### End-to-end workflow (future)
+
+```
+User request
+     │
+     ▼
+Student responds
+     │
+     ▼
+User feedback (👍/👎)
+     │
+     ├── 👍 Good ──▶ Do nothing (student OK)
+     │
+     └── 👎 Bad ──▶ Fallback to teacher
+                         │
+                         ▼
+                   Log (prompt, teacher_response)
+                         │
+                         ▼
+                   Periodic retrain on failures
+```
+
+This trains the student only on its weak spots - cheaper and more targeted than training on everything.
 
 ## Table of Contents
 

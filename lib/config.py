@@ -84,10 +84,11 @@ class HuggingFaceConfig:
 
 @dataclass
 class DatasetConfig:
-    source: str = "file"  # file | huggingface
+    source: str = "file"  # file | huggingface | preference
     path: str = "./curated_train.jsonl"
     huggingface: HuggingFaceConfig = field(default_factory=HuggingFaceConfig)
     format: str = "chatml"  # chatml | sharegpt | alpaca
+    holdout_ratio: float = 0.1  # Fraction held out for evaluation
 
 
 @dataclass

@@ -14,20 +14,21 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Run Mode ──────────────────────────────────────────────────────────────────
-# demo:    Fast test run with minimal examples (default: 50 examples, 1 epoch)
-# full:    Full training run with all configured examples
-# custom:  Use exact settings from this config
+# demo:       Fast test run with minimal examples (default: 50 examples, 1 epoch)
+# full:       Full training run with all configured examples
+# preference: Train on human preference data (UltraFeedback)
+# custom:     Use exact settings from this config
 run_mode: demo
 
 # ── Data Source ───────────────────────────────────────────────────────────────
 dataset:
-  # Source type: file | huggingface
+  # Source type: file | huggingface | preference
   source: file
   
   # For source: file
   path: ./curated_train.jsonl
   
-  # For source: huggingface
+  # For source: huggingface or preference
   huggingface:
     dataset_id: RyokoAI/ShareGPT52K
     split: train
@@ -43,6 +44,9 @@ dataset:
   
   # Format of the data: chatml | sharegpt | alpaca
   format: chatml
+  
+  # Holdout ratio for evaluation (used with preference datasets)
+  holdout_ratio: 0.1
 
 # ── Models ────────────────────────────────────────────────────────────────────
 models:
@@ -189,3 +193,22 @@ presets:
         epochs: 3
     benchmark:
       limit: 100
+  
+  preference:
+    dataset:
+      source: preference
+      huggingface:
+        dataset_id: HuggingFaceH4/ultrafeedback_binarized
+        split: train_prefs
+      holdout_ratio: 0.1
+    curation:
+      max_examples: 1000
+    training:
+      hyperparams:
+        epochs: 1
+      save_checkpoints: true
+      checkpoint_steps: 50
+    benchmark:
+      enabled: false
+    on_policy:
+      enabled: false

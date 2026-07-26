@@ -177,16 +177,24 @@ cmd_help() {
 
   COMMANDS:
     setup               Check environment, install dependencies
-    run [--mode demo]   Run training pipeline
+    run [OPTIONS]       Run training pipeline
     monitor [--fg]      Start dashboard at localhost:8080
     stop                Stop monitor
     status              Show recent runs
     logs                Show latest logs
 
+  RUN OPTIONS:
+    --mode demo|full    Run mode (demo=50 examples, full=5000)
+    --resume latest     Resume on-policy from latest adapter (skips curate+train)
+    --resume <path>     Resume from specific adapter path
+    --on-policy         Enable on-policy distillation
+    --dry-run           Show plan without executing
+
   EXAMPLES:
     ./distill setup                  # First time setup
     ./distill run --mode demo        # Quick test (50 examples, ~5 min)
     ./distill run --mode full        # Full training (5000 examples)
+    ./distill run --resume latest    # Resume on-policy from last adapter
     ./distill monitor                # Start dashboard
 
 EOF

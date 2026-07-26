@@ -33,6 +33,9 @@ if _env_file.exists():
             key, _, value = line.partition("=")
             os.environ.setdefault(key.strip(), value.strip())
 
+# Suppress litellm debug spam
+os.environ.setdefault("LITELLM_LOG", "ERROR")
+
 # Add lib to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -44,7 +47,8 @@ from lib.logger import (
 from lib.dataset import DatasetLoader, load_dataset_from_config
 from lib.deploy import (
     export_gguf, register_ollama_model, list_adapters,
-    get_latest_adapter, deploy_adapter, check_ollama_installed
+    get_latest_adapter, deploy_adapter, check_ollama_installed,
+    cleanup_old_adapters
 )
 
 
@@ -52,7 +56,7 @@ class DistillPipeline:
     """
     Main pipeline orchestrator.
     
-    Coordinates: Curate -> Train -> On-Policy -> Benchmark -> Deploy
+    Coordinates: Curate -> Train -> Evaluate -> Deploy
     """
     
     def __init__(self, config: Config, logger: DistillLogger):
@@ -61,6 +65,7 @@ class DistillPipeline:
         self.run_id = logger.run_id
         self.adapter_path: Optional[str] = None
         self.dataset_path: Optional[str] = None
+        self.holdout_path: Optional[str] = None
         self.metrics: Dict[str, Any] = {}
     
     def run(self, steps: Optional[List[str]] = None, dry_run: bool = False) -> Dict[str, Any]:
@@ -69,13 +74,13 @@ class DistillPipeline:
         
         Args:
             steps: List of steps to run, or None for all.
-                   Valid: ["curate", "train", "on_policy", "benchmark", "deploy"]
+                   Valid: ["curate", "train", "evaluate", "on_policy", "benchmark", "deploy"]
             dry_run: If True, show plan without executing.
         
         Returns:
             Result dict with status and metrics.
         """
-        all_steps = ["curate", "train", "on_policy", "benchmark", "deploy"]
+        all_steps = ["curate", "train", "evaluate", "on_policy", "benchmark", "deploy"]
         steps = steps or all_steps
         
         # Filter based on config
@@ -85,6 +90,9 @@ class DistillPipeline:
             steps = [s for s in steps if s != "benchmark"]
         if not self.config.deploy.gguf.enabled and not self.config.deploy.ollama.enabled:
             steps = [s for s in steps if s != "deploy"]
+        # Only run evaluate if holdout exists (preference dataset)
+        if self.config.dataset.source != "preference":
+            steps = [s for s in steps if s != "evaluate"]
         
         self.logger.header("LOCALDISTILL PIPELINE")
         print_config(self.config)
@@ -99,6 +107,11 @@ class DistillPipeline:
         # Pre-flight checks
         self._validate_on_policy_requirements()
         
+        # Cleanup old adapters to free disk space (keep last 3)
+        removed = cleanup_old_adapters(keep=3, logger=self.logger)
+        if removed:
+            self.logger.info(f"Cleaned up {removed} old adapter(s)")
+        
         # Save frozen config
         config_snapshot = self.logger.run_dir / "config.yaml"
         save_config(self.config, str(config_snapshot))
@@ -109,6 +122,8 @@ class DistillPipeline:
                     self._run_curate()
                 elif step == "train":
                     self._run_train()
+                elif step == "evaluate":
+                    self._run_evaluate()
                 elif step == "on_policy":
                     self._run_on_policy()
                 elif step == "benchmark":
@@ -140,30 +155,77 @@ class DistillPipeline:
         self.logger.set_stage(PipelineStage.CURATE)
         
         loader = DatasetLoader(self.config, self.logger)
+        base_path = Path(self.config.logging.dir).parent
         
-        self.logger.info("Loading dataset...")
-        conversations = loader.load()
-        self.logger.info(f"Loaded {len(conversations)} raw conversations")
-        
-        self.logger.info("Applying curation filters...")
-        curated = loader.curate(conversations)
-        self.logger.info(f"Curated to {len(curated)} conversations")
-        
-        # Export to training file
-        output_path = Path(self.config.logging.dir).parent / "train.jsonl"
-        count = loader.export(curated, str(output_path), "chatml")
-        
-        self.dataset_path = str(output_path)
-        self.metrics["curated_examples"] = count
-        
-        self.logger.success(f"Dataset ready: {count} examples -> {output_path}")
+        # Handle preference datasets differently
+        if self.config.dataset.source == "preference":
+            self.logger.info("Loading preference dataset...")
+            from lib.dataset import split_dataset, PreferencePair
+            
+            pairs = loader.load_preference_pairs()
+            self.logger.info(f"Loaded {len(pairs)} preference pairs")
+            
+            # Split into train/holdout
+            holdout_ratio = self.config.dataset.holdout_ratio
+            train_pairs, holdout_pairs = split_dataset(
+                pairs, 
+                train_ratio=1.0 - holdout_ratio,
+                seed=self.config.training.hyperparams.seed,
+            )
+            self.logger.info(f"Split: {len(train_pairs)} train, {len(holdout_pairs)} holdout")
+            
+            # Export train set (chosen responses only)
+            train_convs = [p.to_chosen_conversation() for p in train_pairs]
+            train_path = base_path / "train.jsonl"
+            count = loader.export(train_convs, str(train_path), "chatml")
+            
+            # Export holdout set (full pairs for evaluation)
+            holdout_path = base_path / "holdout.jsonl"
+            with open(holdout_path, "w") as f:
+                for p in holdout_pairs:
+                    f.write(json.dumps({
+                        "prompt": p.prompt,
+                        "chosen": p.chosen,
+                        "rejected": p.rejected,
+                        "score_chosen": p.score_chosen,
+                        "score_rejected": p.score_rejected,
+                    }) + "\n")
+            
+            self.dataset_path = str(train_path)
+            self.holdout_path = str(holdout_path)
+            self.metrics["train_examples"] = len(train_pairs)
+            self.metrics["holdout_examples"] = len(holdout_pairs)
+            
+            self.logger.success(f"Train: {count} examples -> {train_path}")
+            self.logger.success(f"Holdout: {len(holdout_pairs)} pairs -> {holdout_path}")
+        else:
+            # Original flow for file/huggingface sources
+            self.logger.info("Loading dataset...")
+            conversations = loader.load()
+            self.logger.info(f"Loaded {len(conversations)} raw conversations")
+            
+            self.logger.info("Applying curation filters...")
+            curated = loader.curate(conversations)
+            self.logger.info(f"Curated to {len(curated)} conversations")
+            
+            # Export to training file
+            output_path = base_path / "train.jsonl"
+            count = loader.export(curated, str(output_path), "chatml")
+            
+            self.dataset_path = str(output_path)
+            self.metrics["curated_examples"] = count
+            
+            self.logger.success(f"Dataset ready: {count} examples -> {output_path}")
     
     def _run_train(self):
         """Train step: LoRA fine-tuning with Unsloth."""
         self.logger.set_stage(PipelineStage.TRAIN)
         
         if not self.dataset_path:
-            self.dataset_path = str(Path(self.config.logging.dir).parent / "train.jsonl")
+            # Prefer teacher_pool.jsonl if it exists (better quality: teacher-generated responses)
+            teacher_pool = Path(self.config.logging.dir).parent / "teacher_pool.jsonl"
+            train_jsonl = Path(self.config.logging.dir).parent / "train.jsonl"
+            self.dataset_path = str(teacher_pool if teacher_pool.exists() else train_jsonl)
         
         if not Path(self.dataset_path).exists():
             raise FileNotFoundError(f"Training dataset not found: {self.dataset_path}")
@@ -246,6 +308,10 @@ class DistillPipeline:
         adapter_dir = Path("~/localdistill/adapters").expanduser() / self.run_id[:8]
         adapter_dir.mkdir(parents=True, exist_ok=True)
         
+        # Checkpoint settings
+        save_strategy = "steps" if cfg.save_checkpoints else "no"
+        save_steps = cfg.checkpoint_steps if cfg.save_checkpoints else None
+        
         training_args = TrainingArguments(
             per_device_train_batch_size=cfg.hyperparams.batch_size,
             gradient_accumulation_steps=cfg.hyperparams.gradient_accumulation_steps,
@@ -262,7 +328,9 @@ class DistillPipeline:
             output_dir=str(adapter_dir),
             report_to="none",
             dataloader_num_workers=0,
-            save_strategy="no",
+            save_strategy=save_strategy,
+            save_steps=save_steps,
+            save_total_limit=2,  # Keep only last 2 checkpoints
         )
         
         # Custom callback for logging
@@ -320,6 +388,66 @@ class DistillPipeline:
         self.metrics["training_examples"] = len(dataset)
         self.metrics["epochs"] = cfg.hyperparams.epochs
     
+    def _run_evaluate(self):
+        """Evaluate step: Compare student responses to chosen responses on holdout set."""
+        self.logger.set_stage(PipelineStage.BENCHMARK)  # Reuse benchmark stage for logging
+        
+        if not self.holdout_path:
+            self.holdout_path = str(Path(self.config.logging.dir).parent / "holdout.jsonl")
+        
+        if not Path(self.holdout_path).exists():
+            self.logger.warning(f"No holdout file found: {self.holdout_path}, skipping evaluation")
+            return
+        
+        if not self.adapter_path:
+            self.adapter_path = get_latest_adapter()
+        
+        if not self.adapter_path:
+            self.logger.warning("No adapter found, skipping evaluation")
+            return
+        
+        self.logger.info(f"Evaluating adapter: {self.adapter_path}")
+        self.logger.info(f"Holdout set: {self.holdout_path}")
+        
+        # Load model for inference
+        import torch
+        from unsloth import FastLanguageModel
+        from lib.evaluate import evaluate_model
+        
+        max_seq_length = self.config.training.hyperparams.max_seq_length
+        
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=self.adapter_path,
+            max_seq_length=max_seq_length,
+            dtype=None,
+            load_in_4bit=(self.config.training.quantization == "4bit"),
+        )
+        
+        # Enable inference mode
+        FastLanguageModel.for_inference(model)
+        
+        # Run evaluation (simple judge for now - no API cost)
+        eval_results = evaluate_model(
+            model=model,
+            tokenizer=tokenizer,
+            holdout_path=self.holdout_path,
+            use_llm_judge=False,  # Use simple heuristic judge
+            max_examples=20,  # Limit for speed
+            logger=self.logger,
+        )
+        
+        self.metrics["eval_total"] = eval_results["total"]
+        self.metrics["eval_student_wins"] = eval_results["wins"]["student"]
+        self.metrics["eval_chosen_wins"] = eval_results["wins"]["chosen"]
+        self.metrics["eval_ties"] = eval_results["wins"]["tie"]
+        self.metrics["eval_student_win_rate"] = eval_results["student_win_rate"]
+        
+        # Success criteria: student wins or ties >60%
+        if eval_results["student_win_rate"] >= 0.6:
+            self.logger.success(f"Evaluation PASSED: {eval_results['student_win_rate']*100:.1f}% win rate")
+        else:
+            self.logger.warning(f"Evaluation below target: {eval_results['student_win_rate']*100:.1f}% win rate (target: 60%)")
+    
     def _validate_on_policy_requirements(self):
         """Fail fast if on-policy is enabled but API key missing."""
         if not self.config.on_policy.enabled:
@@ -347,7 +475,7 @@ class DistillPipeline:
         import litellm
         from unsloth import FastLanguageModel, is_bfloat16_supported
         from datasets import load_dataset
-        from transformers import TrainingArguments
+        from transformers import TrainingArguments, TrainerCallback
         from trl import SFTTrainer
         
         cfg = self.config.on_policy
@@ -381,9 +509,23 @@ class DistillPipeline:
         else:
             self.logger.info("Phase 1: Collecting teacher trajectories...")
             
+            # Use partial file for incremental saving (resume support)
+            partial_path = Path(str(teacher_pool_path) + ".partial")
             teacher_pool = []
+            start_idx = 0
+            
+            # Resume from partial if exists
+            if partial_path.exists():
+                with open(partial_path) as f:
+                    for line in f:
+                        teacher_pool.append(json.loads(line))
+                start_idx = len(teacher_pool)
+                self.logger.info(f"Resuming from {start_idx} completed conversations")
             
             for idx, example in enumerate(dataset):
+                if idx < start_idx:
+                    continue  # Skip already processed
+                    
                 messages = example.get("messages", [])
                 if not messages:
                     continue
@@ -426,14 +568,18 @@ class DistillPipeline:
                 
                 if conversation:
                     teacher_pool.append({"messages": conversation})
+                    # Incremental save after each conversation
+                    with open(partial_path, "a") as f:
+                        f.write(json.dumps({"messages": conversation}) + "\n")
                 
-                if (idx + 1) % 10 == 0:
-                    self.logger.info(f"Collected {idx + 1}/{len(dataset)} conversations")
+                # Update progress for dashboard
+                progress = ((idx + 1) / len(dataset)) * 50  # Phase 1 is 0-50%
+                if (idx + 1) % 5 == 0 or idx == len(dataset) - 1:
+                    self.logger.set_progress(progress, f"Phase 1: {idx + 1}/{len(dataset)} conversations")
             
-            # Save teacher pool
-            with open(teacher_pool_path, "w") as f:
-                for item in teacher_pool:
-                    f.write(json.dumps(item) + "\n")
+            # Rename partial to final (atomic completion marker)
+            if partial_path.exists():
+                partial_path.rename(teacher_pool_path)
             
             total_tokens = total_prompt_tokens + total_completion_tokens
             self.logger.info(f"Phase 1 complete: {len(teacher_pool)} conversations")
@@ -486,34 +632,46 @@ class DistillPipeline:
         
         # Load for training — continue from SFT adapter if available
         max_seq_length = self.config.training.hyperparams.max_seq_length
-        
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=self.config.models.student,
-            max_seq_length=max_seq_length,
-            dtype=None,
-            load_in_4bit=(self.config.training.quantization == "4bit"),
-        )
-        
-        # Load SFT adapter weights if we have them, then apply LoRA on top
         tcfg = self.config.training
-        if self.adapter_path and Path(self.adapter_path).exists():
-            self.logger.info(f"Loading SFT adapter: {self.adapter_path}")
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, self.adapter_path)
-            model = model.merge_and_unload()  # Merge weights so we can apply fresh LoRA
-            self.logger.info("Merged SFT adapter weights into base model")
         
-        # Apply fresh LoRA for on-policy training
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=tcfg.lora.rank,
-            target_modules=tcfg.lora.target_modules,
-            lora_alpha=tcfg.lora.alpha,
-            lora_dropout=tcfg.lora.dropout,
-            bias="none",
-            use_gradient_checkpointing="unsloth",
-            random_state=tcfg.hyperparams.seed,
-        )
+        if self.adapter_path and Path(self.adapter_path).exists():
+            # Continue training existing adapter (no merge, avoids dtype issues)
+            self.logger.info(f"Loading SFT adapter for continued training: {self.adapter_path}")
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=self.adapter_path,
+                max_seq_length=max_seq_length,
+                dtype=None,
+                load_in_4bit=(self.config.training.quantization == "4bit"),
+            )
+            # Re-enable training on the loaded adapter
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=tcfg.lora.rank,
+                target_modules=tcfg.lora.target_modules,
+                lora_alpha=tcfg.lora.alpha,
+                lora_dropout=tcfg.lora.dropout,
+                bias="none",
+                use_gradient_checkpointing="unsloth",
+                random_state=tcfg.hyperparams.seed,
+            )
+        else:
+            # Fresh model
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=self.config.models.student,
+                max_seq_length=max_seq_length,
+                dtype=None,
+                load_in_4bit=(self.config.training.quantization == "4bit"),
+            )
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=tcfg.lora.rank,
+                target_modules=tcfg.lora.target_modules,
+                lora_alpha=tcfg.lora.alpha,
+                lora_dropout=tcfg.lora.dropout,
+                bias="none",
+                use_gradient_checkpointing="unsloth",
+                random_state=tcfg.hyperparams.seed,
+            )
         
         # Load weighted dataset
         op_dataset = load_dataset("json", data_files=str(weighted_path), split="train")
@@ -552,8 +710,12 @@ class DistillPipeline:
         
         self.logger.info(f"Sampled {len(sampled_dataset)} examples (weighted by step-decay)")
         
-        # Train
-        adapter_dir = Path("~/localdistill/adapters").expanduser() / f"{self.run_id[:8]}_onpolicy"
+        # Train - use SFT adapter name as base for on_policy dir (enables resume)
+        if self.adapter_path:
+            sft_name = Path(self.adapter_path).name.replace("_onpolicy", "")
+            adapter_dir = Path("~/localdistill/adapters").expanduser() / f"{sft_name}_onpolicy"
+        else:
+            adapter_dir = Path("~/localdistill/adapters").expanduser() / f"{self.run_id[:8]}_onpolicy"
         adapter_dir.mkdir(parents=True, exist_ok=True)
         
         training_args = TrainingArguments(
@@ -572,8 +734,32 @@ class DistillPipeline:
             output_dir=str(adapter_dir),
             report_to="none",
             dataloader_num_workers=0,
-            save_strategy="no",
+            save_strategy="no",  # Checkpointing broken with unsloth/trl, save at end only
         )
+        
+        # Custom callback for logging (same as SFT phase)
+        class LogCallback(TrainerCallback):
+            def __init__(cb_self, logger, total_steps):
+                cb_self.logger = logger
+                cb_self.step = 0
+                cb_self.total_steps = total_steps
+            
+            def on_log(cb_self, args, state, control, logs=None, **kwargs):
+                if logs and "loss" in logs:
+                    cb_self.step = state.global_step
+                    loss = logs.get("loss", 0)
+                    lr = logs.get("learning_rate", 0)
+                    cb_self.logger.log_training_step(cb_self.step, loss, lr, phase="on_policy")
+                    # Phase 2 progress: 50-100%
+                    if cb_self.total_steps > 0:
+                        progress = 50 + (cb_self.step / cb_self.total_steps) * 50
+                        cb_self.logger.set_progress(progress, f"Phase 2: step {cb_self.step}/{cb_self.total_steps}")
+        
+        # Estimate total steps
+        batch_size = tcfg.hyperparams.batch_size * tcfg.hyperparams.gradient_accumulation_steps
+        total_steps = max(1, len(sampled_dataset) // batch_size)
+        
+        log_callback = LogCallback(self.logger, total_steps)
         
         trainer = SFTTrainer(
             model=model,
@@ -584,10 +770,13 @@ class DistillPipeline:
             dataset_num_proc=1,
             packing=False,
             args=training_args,
+            callbacks=[log_callback],
         )
         
         self.logger.info(f"Training on {len(sampled_dataset)} step-decay weighted examples")
+        self.logger.set_progress(50, "Phase 2: training started")
         trainer.train()
+        self.logger.set_progress(100, "Phase 2: complete")
         
         # Save adapter
         model.save_pretrained(str(adapter_dir))
@@ -728,6 +917,10 @@ def cmd_run(args):
     # Override with CLI args
     if args.mode:
         config.run_mode = args.mode
+        # Apply preset for the new mode if it exists
+        if args.mode in config.presets:
+            preset = config.presets[args.mode]
+            _apply_preset(config, preset)
     if args.student:
         config.models.student = args.student
     if args.teacher:
@@ -739,10 +932,31 @@ def cmd_run(args):
     if args.on_policy:
         config.on_policy.enabled = True
     
+    # Handle --resume: skip curate+train, use existing adapter
+    resume_adapter = None
+    if args.resume:
+        resume_path = Path(args.resume).expanduser()
+        if resume_path.exists() and (resume_path / "adapter_config.json").exists():
+            resume_adapter = str(resume_path)
+        elif args.resume == "latest":
+            resume_adapter = get_latest_adapter()
+        else:
+            print(f"Error: Invalid adapter path: {args.resume}")
+            return 1
+        
+        if not resume_adapter:
+            print("Error: No adapter found to resume from")
+            return 1
+        
+        print(f"Resuming from adapter: {resume_adapter}")
+        config.on_policy.enabled = True  # --resume implies on_policy
+    
     # Parse steps
     steps = None
     if args.steps:
         steps = [s.strip() for s in args.steps.split(",")]
+    elif resume_adapter:
+        steps = ["on_policy", "deploy"]  # Skip curate+train when resuming
     
     # Create logger
     run_id = str(uuid.uuid4())
@@ -750,6 +964,9 @@ def cmd_run(args):
     
     # Run pipeline
     pipeline = DistillPipeline(config, logger)
+    if resume_adapter:
+        pipeline.adapter_path = resume_adapter
+        pipeline.dataset_path = str(Path(config.logging.dir).parent / "train.jsonl")
     result = pipeline.run(steps=steps, dry_run=args.dry_run)
     
     # Print summary
@@ -759,6 +976,44 @@ def cmd_run(args):
     print(json.dumps(result, indent=2))
     
     return 0 if result["status"] in ("completed", "dry_run") else 1
+
+
+def _apply_preset(config, preset: dict):
+    """Apply a preset dict to config object."""
+    for key, value in preset.items():
+        if key == "dataset" and isinstance(value, dict):
+            for dk, dv in value.items():
+                if dk == "huggingface" and isinstance(dv, dict):
+                    for hk, hv in dv.items():
+                        setattr(config.dataset.huggingface, hk, hv)
+                else:
+                    setattr(config.dataset, dk, dv)
+        elif key == "curation" and isinstance(value, dict):
+            for ck, cv in value.items():
+                if ck == "filters" and isinstance(cv, dict):
+                    config.curation.filters.update(cv)
+                else:
+                    setattr(config.curation, ck, cv)
+        elif key == "training" and isinstance(value, dict):
+            if "hyperparams" in value:
+                for hk, hv in value["hyperparams"].items():
+                    setattr(config.training.hyperparams, hk, hv)
+            if "lora" in value:
+                for lk, lv in value["lora"].items():
+                    setattr(config.training.lora, lk, lv)
+        elif key == "on_policy" and isinstance(value, dict):
+            for ok, ov in value.items():
+                setattr(config.on_policy, ok, ov)
+        elif key == "benchmark" and isinstance(value, dict):
+            for bk, bv in value.items():
+                setattr(config.benchmark, bk, bv)
+        elif key == "deploy" and isinstance(value, dict):
+            if "gguf" in value:
+                for gk, gv in value["gguf"].items():
+                    setattr(config.deploy.gguf, gk, gv)
+            if "ollama" in value:
+                for ok, ov in value["ollama"].items():
+                    setattr(config.deploy.ollama, ok, ov)
 
 
 def cmd_status(args):
@@ -863,7 +1118,7 @@ Examples:
     # run command
     run_parser = subparsers.add_parser("run", help="Run the pipeline")
     run_parser.add_argument("--config", "-c", help="Config file path")
-    run_parser.add_argument("--mode", "-m", choices=["demo", "full", "custom"],
+    run_parser.add_argument("--mode", "-m", choices=["demo", "full", "preference", "custom"],
                            help="Run mode (overrides config)")
     run_parser.add_argument("--student", help="Student model")
     run_parser.add_argument("--teacher", help="Teacher model")
@@ -871,6 +1126,7 @@ Examples:
     run_parser.add_argument("--epochs", type=int, help="Training epochs")
     run_parser.add_argument("--steps", help="Comma-separated steps: curate,train,benchmark,deploy")
     run_parser.add_argument("--on-policy", action="store_true", help="Enable on-policy distillation")
+    run_parser.add_argument("--resume", help="Resume from adapter path (skips curate+train, runs on_policy+deploy)")
     run_parser.add_argument("--dry-run", action="store_true", help="Show plan without executing")
     
     # status command

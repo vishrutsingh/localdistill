@@ -4,15 +4,16 @@ LocalDistill Dataset Loader
 Loads training data from:
 - Local JSONL files (ChatML, ShareGPT, Alpaca formats)
 - HuggingFace datasets
+- Preference datasets (chosen/rejected pairs)
 
 Applies curation filters and exports to training format.
 """
 
 import json
-import re
+import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Iterator, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from lib.config import Config, CurationConfig, DatasetConfig
 
@@ -54,6 +55,24 @@ class Conversation:
         }
 
 
+@dataclass
+class PreferencePair:
+    """A preference pair with chosen and rejected responses."""
+    prompt: str
+    chosen: List[Dict[str, str]]   # Full conversation with good response
+    rejected: List[Dict[str, str]] # Full conversation with bad response
+    score_chosen: float = None
+    score_rejected: float = None
+    
+    def to_chosen_conversation(self) -> Conversation:
+        """Extract just the chosen conversation for SFT."""
+        return Conversation(messages=self.chosen)
+    
+    def to_rejected_conversation(self) -> Conversation:
+        """Extract the rejected conversation (for analysis)."""
+        return Conversation(messages=self.rejected)
+
+
 class DatasetLoader:
     """
     Unified dataset loader supporting multiple sources and formats.
@@ -77,8 +96,81 @@ class DatasetLoader:
             return self._load_from_file()
         elif self.dataset_config.source == "huggingface":
             return self._load_from_huggingface()
+        elif self.dataset_config.source == "preference":
+            # Load preference dataset, return only chosen conversations
+            pairs = self._load_preference_dataset()
+            return [p.to_chosen_conversation() for p in pairs]
         else:
             raise ValueError(f"Unknown dataset source: {self.dataset_config.source}")
+    
+    def load_preference_pairs(self) -> List[PreferencePair]:
+        """Load preference dataset as pairs (for evaluation)."""
+        if self.dataset_config.source != "preference":
+            raise ValueError("load_preference_pairs requires source='preference'")
+        return self._load_preference_dataset()
+    
+    def _load_preference_dataset(self) -> List[PreferencePair]:
+        """Load HuggingFaceH4/ultrafeedback_binarized or similar preference dataset."""
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("Install datasets: pip install datasets")
+        
+        hf_config = self.dataset_config.huggingface
+        dataset_id = hf_config.dataset_id
+        split = hf_config.split
+        
+        self._log(f"Loading preference dataset: {dataset_id} ({split})")
+        
+        dataset = load_dataset(dataset_id, split=split)
+        
+        pairs = []
+        max_examples = self.curation_config.max_examples
+        
+        for item in dataset:
+            # Handle ultrafeedback_binarized format
+            chosen = item.get("chosen", [])
+            rejected = item.get("rejected", [])
+            prompt = item.get("prompt", "")
+            
+            if not chosen or not rejected:
+                continue
+            
+            # Normalize message format
+            chosen_msgs = self._normalize_messages(chosen)
+            rejected_msgs = self._normalize_messages(rejected)
+            
+            if not chosen_msgs or not rejected_msgs:
+                continue
+            
+            pair = PreferencePair(
+                prompt=prompt,
+                chosen=chosen_msgs,
+                rejected=rejected_msgs,
+                score_chosen=item.get("score_chosen"),
+                score_rejected=item.get("score_rejected"),
+            )
+            pairs.append(pair)
+            
+            if max_examples and len(pairs) >= max_examples:
+                break
+        
+        self._log(f"Loaded {len(pairs)} preference pairs")
+        return pairs
+    
+    def _normalize_messages(self, messages: List) -> List[Dict[str, str]]:
+        """Normalize message format to [{role, content}, ...]."""
+        if not messages:
+            return []
+        
+        normalized = []
+        for msg in messages:
+            if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                normalized.append({
+                    "role": msg["role"],
+                    "content": str(msg["content"]),
+                })
+        return normalized
     
     def _load_from_file(self) -> List[Conversation]:
         """Load from local JSONL file."""
@@ -387,20 +479,85 @@ def load_dataset_from_config(config: Config, logger=None) -> Tuple[List[Conversa
     return loader.load_and_curate()
 
 
+def split_dataset(
+    items: List,
+    train_ratio: float = 0.9,
+    seed: int = 42,
+) -> Tuple[List, List]:
+    """Split dataset into train and holdout sets.
+    
+    Args:
+        items: List of items to split (Conversations or PreferencePairs)
+        train_ratio: Fraction for training (default 0.9 = 90% train, 10% holdout)
+        seed: Random seed for reproducibility
+    
+    Returns:
+        (train_set, holdout_set)
+    """
+    items = list(items)  # Copy to avoid mutating original
+    random.seed(seed)
+    random.shuffle(items)
+    
+    split_idx = int(len(items) * train_ratio)
+    return items[:split_idx], items[split_idx:]
+
+
 if __name__ == "__main__":
     # Test the loader
-    from lib.config import load_config
+    import sys
     
-    config = load_config()
-    loader = DatasetLoader(config)
-    
-    conversations = loader.load()
-    print(f"Loaded {len(conversations)} conversations")
-    
-    if conversations:
-        print(f"\nFirst conversation ({conversations[0].turn_count} turns):")
-        for msg in conversations[0].messages[:2]:
-            print(f"  [{msg['role']}]: {msg['content'][:100]}...")
-    
-    curated = loader.curate(conversations)
-    print(f"\nAfter curation: {len(curated)} conversations")
+    if len(sys.argv) > 1 and sys.argv[1] == "preference":
+        # Test preference dataset loading
+        print("Testing preference dataset loading...")
+        print("Dataset: HuggingFaceH4/ultrafeedback_binarized")
+        
+        from datasets import load_dataset
+        ds = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs")
+        
+        # Convert to PreferencePairs
+        pairs = []
+        for i, item in enumerate(ds):
+            if i >= 100:  # Just load 100 for testing
+                break
+            chosen = item.get("chosen", [])
+            rejected = item.get("rejected", [])
+            if chosen and rejected:
+                pairs.append(PreferencePair(
+                    prompt=item.get("prompt", ""),
+                    chosen=chosen,
+                    rejected=rejected,
+                    score_chosen=item.get("score_chosen"),
+                    score_rejected=item.get("score_rejected"),
+                ))
+        
+        print(f"Loaded {len(pairs)} preference pairs")
+        
+        # Split
+        train, holdout = split_dataset(pairs, train_ratio=0.9)
+        print(f"Split: {len(train)} train, {len(holdout)} holdout")
+        
+        # Show sample
+        if pairs:
+            p = pairs[0]
+            print(f"\nSample pair:")
+            print(f"  Prompt: {p.prompt[:100]}...")
+            print(f"  Chosen score: {p.score_chosen}")
+            print(f"  Rejected score: {p.score_rejected}")
+            print(f"  Chosen response: {p.chosen[-1]['content'][:100]}...")
+    else:
+        # Original test
+        from lib.config import load_config
+        
+        config = load_config()
+        loader = DatasetLoader(config)
+        
+        conversations = loader.load()
+        print(f"Loaded {len(conversations)} conversations")
+        
+        if conversations:
+            print(f"\nFirst conversation ({conversations[0].turn_count} turns):")
+            for msg in conversations[0].messages[:2]:
+                print(f"  [{msg['role']}]: {msg['content'][:100]}...")
+        
+        curated = loader.curate(conversations)
+        print(f"\nAfter curation: {len(curated)} conversations")
