@@ -56,7 +56,7 @@ models:
   # Teacher model (for on-policy distillation)
   # Use OpenRouter format: openrouter/<provider>/<model>
   # Or direct: openai/gpt-4o, anthropic/claude-3-sonnet, etc.
-  teacher: openrouter/qwen/qwen-2.5-7b-instruct
+  teacher: openrouter/deepseek/deepseek-chat
 
 # ── Curation Settings ─────────────────────────────────────────────────────────
 curation:
@@ -202,12 +202,12 @@ presets:
         split: train_prefs
       holdout_ratio: 0.1
     curation:
-      max_examples: 1000
+      max_examples: 5000
     training:
       hyperparams:
-        epochs: 1
+        epochs: 3
       save_checkpoints: true
-      checkpoint_steps: 50
+      checkpoint_steps: 100
     benchmark:
       enabled: false
     on_policy:

@@ -426,13 +426,17 @@ class DistillPipeline:
         # Enable inference mode
         FastLanguageModel.for_inference(model)
         
-        # Run evaluation (simple judge for now - no API cost)
+        # Run evaluation with teacher model as judge
+        teacher_model = self.config.models.teacher
+        self.logger.info(f"Using teacher as judge: {teacher_model}")
+        
         eval_results = evaluate_model(
             model=model,
             tokenizer=tokenizer,
             holdout_path=self.holdout_path,
-            use_llm_judge=False,  # Use simple heuristic judge
-            max_examples=20,  # Limit for speed
+            use_llm_judge=True,
+            judge_model=teacher_model,
+            max_examples=50,  # More examples with LLM judge
             logger=self.logger,
         )
         

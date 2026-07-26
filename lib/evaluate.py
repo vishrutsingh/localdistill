@@ -71,33 +71,101 @@ def simple_judge(
     response_a: str,
     response_b: str,
 ) -> str:
-    """Simple heuristic judge - compares response quality.
+    """Heuristic judge - compares response quality without LLM.
     
     Returns: "a", "b", or "tie"
     
-    This is a placeholder - for real evaluation, use an LLM judge.
+    Heuristics:
+    1. Penalize empty/too short responses
+    2. Penalize repetition
+    3. Check if response addresses the prompt
+    4. Prefer structured responses (lists, paragraphs)
+    5. Penalize excessive length (rambling)
     """
-    # Simple heuristics:
-    # 1. Longer responses tend to be more helpful (up to a point)
-    # 2. Responses that address the question directly
     
-    len_a = len(response_a)
-    len_b = len(response_b)
+    def score_response(response: str, prompt: str) -> float:
+        score = 0.0
+        
+        # 1. Length checks
+        length = len(response)
+        if length < 20:
+            return -10  # Too short, useless
+        if length < 50:
+            score -= 3  # Very short
+        elif length < 100:
+            score -= 1  # Short
+        elif length > 2000:
+            score -= 2  # Too long, probably rambling
+        elif length > 500:
+            score += 1  # Good length
+        
+        # 2. Repetition detection
+        words = response.lower().split()
+        if len(words) > 10:
+            unique_ratio = len(set(words)) / len(words)
+            if unique_ratio < 0.3:
+                score -= 5  # Heavy repetition
+            elif unique_ratio < 0.5:
+                score -= 2  # Some repetition
+            elif unique_ratio > 0.7:
+                score += 1  # Good variety
+        
+        # 3. Prompt relevance - check if key words from prompt appear
+        prompt_words = set(prompt.lower().split())
+        response_words = set(response.lower().split())
+        # Remove common words
+        common = {"the", "a", "an", "is", "are", "was", "were", "be", "been", 
+                  "being", "have", "has", "had", "do", "does", "did", "will",
+                  "would", "could", "should", "may", "might", "must", "shall",
+                  "can", "to", "of", "in", "for", "on", "with", "at", "by",
+                  "from", "as", "into", "through", "during", "before", "after",
+                  "above", "below", "between", "under", "again", "further",
+                  "then", "once", "here", "there", "when", "where", "why",
+                  "how", "all", "each", "few", "more", "most", "other", "some",
+                  "such", "no", "nor", "not", "only", "own", "same", "so",
+                  "than", "too", "very", "just", "and", "but", "if", "or",
+                  "because", "until", "while", "what", "which", "who", "whom",
+                  "this", "that", "these", "those", "i", "me", "my", "myself",
+                  "you", "your", "yourself", "he", "him", "his", "she", "her",
+                  "it", "its", "we", "us", "our", "they", "them", "their"}
+        prompt_keywords = prompt_words - common
+        overlap = prompt_keywords & response_words
+        if prompt_keywords:
+            relevance = len(overlap) / len(prompt_keywords)
+            if relevance > 0.5:
+                score += 2  # Addresses prompt well
+            elif relevance > 0.2:
+                score += 1  # Somewhat relevant
+            elif relevance < 0.1:
+                score -= 2  # Doesn't address prompt
+        
+        # 4. Structure indicators
+        if '\n' in response:
+            score += 1  # Has paragraphs/structure
+        if any(marker in response for marker in ['1.', '2.', '- ', '* ', '•']):
+            score += 1  # Has lists
+        if '```' in response:
+            score += 0.5  # Has code blocks (good for technical)
+        
+        # 5. Coherence - starts with capital, ends with punctuation
+        if response and response[0].isupper():
+            score += 0.5
+        if response and response.rstrip()[-1] in '.!?':
+            score += 0.5
+        
+        return score
     
-    # Too short is bad
-    if len_a < 50 and len_b >= 50:
+    score_a = score_response(response_a, prompt)
+    score_b = score_response(response_b, prompt)
+    
+    diff = score_a - score_b
+    
+    if diff > 1.5:
+        return "a"
+    elif diff < -1.5:
         return "b"
-    if len_b < 50 and len_a >= 50:
-        return "a"
-    
-    # Similar length = tie
-    if abs(len_a - len_b) < 100:
+    else:
         return "tie"
-    
-    # Slightly prefer longer (more detailed)
-    if len_a > len_b:
-        return "a"
-    return "b"
 
 
 def llm_judge(
