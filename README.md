@@ -1,533 +1,133 @@
 # LocalDistill
 
-**Distill knowledge from powerful cloud LLMs into smaller local models you own.**
+Distill cloud LLM knowledge into local models you own.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│   Cloud LLMs (GPT-4, Claude, DeepSeek)                                     │
-│                         │                                                   │
-│                         ▼                                                   │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │                    LOCALDISTILL PIPELINE                            │  │
-│   │                                                                     │  │
-│   │   [Curate] ──▶ [Train] ──▶ [Evaluate] ──▶ [Deploy]                  │  │
-│   │                                                                     │  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
-│                         │                                                   │
-│                         ▼                                                   │
-│   Your Local Model (Ollama / llama.cpp)                                    │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+Cloud LLM (GPT-4, DeepSeek)    Your Data
+         │                        │
+         └──────────┬─────────────┘
+                    ▼
+         ┌──────────────────────┐
+         │    LocalDistill      │
+         │                      │
+         │  curate → train →    │
+         │  evaluate → deploy   │
+         └──────────────────────┘
+                    │
+                    ▼
+         Local Model (Ollama)
+         - Runs on your hardware
+         - No API costs
+         - Private
 ```
-
----
-
-## Current Plan (Proof of Concept)
-
-**Goal:** Prove the distillation pipeline works before building full user-facing proxy.
-
-**Target user:** Business running ~10k LLM queries/day who wants to reduce cost by training a local model on their usage patterns.
-
-### Approach
-
-1. **Dataset:** `HuggingFaceH4/ultrafeedback_binarized` (GPT-4 scored quality preferences)
-2. **Split:** 90% train / 10% holdout
-3. **Train:** SFT student (Llama 3.2 3B) on "chosen" responses only
-4. **Evaluate:** On holdout set, compare student output vs chosen response
-5. **Success criteria:** Student wins or ties >60% of the time vs base model
-
-### Why this approach
-
-- **Not using Anthropic hh-rlhf:** That dataset is about safety/refusals, not response quality
-- **Not using lmsys/chatbot_arena:** Gated dataset, requires authentication
-- **Single training round first:** If one round doesn't improve the model, multiple rounds won't save it
-
-### Implementation Status
-
-| Component | Status |
-|-----------|--------|
-| Dataset loader for preference format | DONE |
-| Train/holdout split | DONE |
-| SFT training | DONE |
-| Checkpointing | DONE |
-| Evaluation (student vs chosen) | DONE |
-| LLM judge | TODO (using heuristic) |
-
-### Running the PoC
-
-```bash
-# Full pipeline (curate -> train -> evaluate)
-./distill run --mode preference
-
-# Or step by step
-./distill run --mode preference --steps curate
-./distill run --mode preference --steps train
-./distill run --mode preference --steps evaluate
-
-# With more examples (default 1000)
-./distill run --mode preference --max-examples 5000
-```
-
-### End-to-end workflow (future)
-
-```
-User request
-     │
-     ▼
-Student responds
-     │
-     ▼
-User feedback (👍/👎)
-     │
-     ├── 👍 Good ──▶ Do nothing (student OK)
-     │
-     └── 👎 Bad ──▶ Fallback to teacher
-                         │
-                         ▼
-                   Log (prompt, teacher_response)
-                         │
-                         ▼
-                   Periodic retrain on failures
-```
-
-This trains the student only on its weak spots - cheaper and more targeted than training on everything.
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [Local Run](#local-run)
-- [Configuration](#configuration)
-- [Docker](#docker)
-- [CLI Reference](#cli-reference)
-- [Troubleshooting](#troubleshooting)
-
----
 
 ## Quick Start
 
 ```bash
-# 1. Setup (checks GPU, installs dependencies)
+# Setup (checks GPU, installs deps)
 ./distill setup
 
-# 2. Start dashboard (http://localhost:8080)
-./distill monitor
-
-# 3. Run demo training (~5 min)
-./distill run --mode demo
+# Run training
+./distill run --mode demo      # 5 min test
+./distill run --mode full      # production run
 ```
 
-That's it. For full training with on-policy distillation:
+## Requirements
+
+- Python 3.10+
+- NVIDIA GPU, 4GB+ VRAM
+- CUDA drivers
+
+## CLI
+
+```
+./distill <command>
+
+Commands:
+  setup       Check environment, install dependencies
+  run         Run training pipeline
+  monitor     Start dashboard at :8080
+  stop        Stop dashboard
+  status      Show recent runs
+  logs        Tail latest logs
+
+Run options:
+  --mode <mode>       demo | full | preference | custom
+  --steps <steps>     curate,train,evaluate,benchmark,deploy
+  --max-examples <n>  Training examples
+  --epochs <n>        Training epochs
+  --student <model>   Student model (default: Llama-3.2-3B)
+  --teacher <model>   Teacher/judge model (default: DeepSeek)
+  --on-policy         Enable on-policy distillation
+  --dry-run           Show plan only
+```
+
+**Examples:**
 
 ```bash
-# Set API key for teacher model
-echo "OPENROUTER_API_KEY=sk-or-v1-xxxx" >> .env
+# Preference learning (UltraFeedback dataset)
+./distill run --mode preference
 
-# Run full training with on-policy
-./distill run --mode full --on-policy
+# Step by step
+./distill run --mode preference --steps curate
+./distill run --mode preference --steps train
+./distill run --mode preference --steps evaluate
+
+# Low VRAM (<6GB)
+./distill run --student unsloth/Llama-3.2-1B-Instruct
+
+# Custom
+./distill run --max-examples 2000 --epochs 2
 ```
-
----
-
-## Local Run
-
-### Prerequisites
-
-- **Python 3.10+**
-- **NVIDIA GPU** with 4GB+ VRAM (6GB+ recommended)
-- **CUDA drivers** installed
-
-### Setup
-
-```bash
-# Check environment and install dependencies
-./distill setup
-```
-
-This will:
-- Verify Python and GPU
-- Install PyTorch, Unsloth, datasets, FastAPI
-- Report your detected configuration
-
-### Running Training
-
-**Demo mode** (50 examples, 1 epoch, ~5 min):
-```bash
-./distill run --mode demo
-```
-
-**Full mode** (5000 examples, 3 epochs):
-```bash
-./distill run --mode full
-```
-
-**With on-policy distillation** (requires API key):
-```bash
-./distill run --mode full --on-policy
-```
-
-**Low VRAM** (<6GB free):
-```bash
-./distill run --mode demo --student unsloth/Llama-3.2-1B-Instruct
-```
-
-### Monitor Dashboard
-
-```bash
-# Start dashboard (background)
-./distill monitor
-
-# View at http://localhost:8080
-
-# Stop dashboard
-./distill stop
-```
-
-Dashboard shows:
-- Real-time training progress
-- Loss curves
-- Run history
-- Logs and metrics
-
----
 
 ## Configuration
 
-All settings are in `config.yaml`. You can also override via CLI flags.
+Edit `config.yaml` or use CLI flags.
 
-### API Keys
+**Models:**
 
-Create `.env` file for API keys (needed for on-policy distillation):
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-```bash
-# OpenRouter (recommended - one key for all models)
-OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxx
-
-# Or use direct API keys
-OPENAI_API_KEY=sk-xxxx
-ANTHROPIC_API_KEY=sk-ant-xxxx
-```
-
-### Models
-
-```yaml
-models:
-  # Student: local model to train
-  student: unsloth/Llama-3.2-3B-Instruct
-  
-  # Teacher: API model for on-policy distillation
-  teacher: openrouter/deepseek/deepseek-chat
-```
-
-**Available student models:**
-
-| Model | VRAM | Notes |
-|-------|------|-------|
-| `unsloth/Llama-3.2-1B-Instruct` | ~3GB | Low VRAM option |
-| `unsloth/Llama-3.2-3B-Instruct` | ~5GB | Default, good balance |
-| `unsloth/Qwen2.5-3B-Instruct` | ~5GB | Alternative 3B |
+| Student | VRAM | Notes |
+|---------|------|-------|
+| `unsloth/Llama-3.2-1B-Instruct` | ~3GB | Low VRAM |
+| `unsloth/Llama-3.2-3B-Instruct` | ~5GB | Default |
 | `unsloth/Llama-3.1-8B-Instruct` | ~10GB | Higher quality |
 
-**Available teacher models:**
-
-| Model | Cost | Quality |
-|-------|------|---------|
-| `openrouter/deepseek/deepseek-chat` | $ | Good |
-| `openrouter/anthropic/claude-3-haiku` | $$ | Great |
-| `openrouter/openai/gpt-4o-mini` | $$ | Great |
-| `openrouter/anthropic/claude-3.5-sonnet` | $$$ | Best |
-
-### Dataset
-
-```yaml
-dataset:
-  # Local file (default: pre-curated 42K ShareGPT conversations)
-  source: file
-  path: ./curated_train.jsonl
-  
-  # Or load from HuggingFace
-  source: huggingface
-  huggingface:
-    dataset_id: RyokoAI/ShareGPT52K
-    split: train
-```
-
-### Training
-
-```yaml
-training:
-  lora:
-    rank: 16              # LoRA rank (higher = more capacity)
-    alpha: 32             # LoRA alpha (usually 2x rank)
-    dropout: 0            # Dropout (0 for small datasets)
-    
-  hyperparams:
-    learning_rate: 2.0e-4
-    epochs: 3
-    batch_size: 2
-    gradient_accumulation_steps: 4
-    max_seq_length: 2048  # Reduce to 1024 for low VRAM
-    warmup_steps: 5
-    weight_decay: 0.01
-    lr_scheduler: linear
-    seed: 42
-    
-  quantization: 4bit      # 4bit | 8bit | none
-```
-
-### Curation
-
-```yaml
-curation:
-  max_examples: 5000      # null = use all
-  min_quality_score: 0.0
-  
-  filters:
-    min_turns: 2          # Minimum conversation turns
-    max_turns: 50         # Maximum conversation turns
-    min_chars: 100        # Minimum total characters
-    max_chars: 50000      # Maximum total characters
-    exclude_code_heavy: false
-```
-
-### On-Policy Distillation (ReOPD)
-
-```yaml
-on_policy:
-  enabled: true
-  teacher_query_interval: 10    # Controls decay: kappa = 1 - 1/interval
-  decay_function: exponential   # exponential | linear
-  exponential_lambda: 0.9       # Direct kappa value
-```
-
-Two-phase offline distillation (based on ReOPD paper):
-1. **Phase 1**: Collect teacher trajectories once (cached as `teacher_pool.jsonl`)
-2. **Phase 2**: Train with step-decay weighting — earlier turns weighted higher (w_t = κ^t)
-
-Token usage is logged during Phase 1. Phase 2 uses zero API calls.
-
-### Benchmark
-
-```yaml
-benchmark:
-  enabled: true
-  tasks: [gsm8k]          # gsm8k, mmlu, hellaswag, truthfulqa
-  limit: 50               # Examples per task
-  compare_base: true      # Compare with base model
-```
-
-### Deploy
-
-```yaml
-deploy:
-  gguf:
-    enabled: true
-    quantization: q4_k_m  # q4_k_m, q5_k_m, q8_0, f16
-    
-  ollama:
-    enabled: false
-    model_name: localdistill
-    auto_register: true
-```
-
-### Presets
-
-Built-in presets override settings:
-
-| Mode | Examples | Epochs | Use Case |
-|------|----------|--------|----------|
-| `demo` | 50 | 1 | Quick test (~5 min) |
-| `full` | 5000 | 3 | Production training |
-| `custom` | Your config | Your config | Full control |
-
-### Full config.yaml Example
-
-```yaml
-run_mode: demo
-
-dataset:
-  source: file
-  path: ./curated_train.jsonl
-
-models:
-  student: unsloth/Llama-3.2-3B-Instruct
-  teacher: openrouter/deepseek/deepseek-chat
-
-curation:
-  max_examples: 5000
-  filters:
-    min_turns: 2
-    max_turns: 50
-
-training:
-  lora:
-    rank: 16
-    alpha: 32
-  hyperparams:
-    learning_rate: 2.0e-4
-    epochs: 3
-    batch_size: 2
-    max_seq_length: 2048
-  quantization: 4bit
-
-on_policy:
-  enabled: false
-  teacher_query_interval: 10
-
-benchmark:
-  enabled: true
-  tasks: [gsm8k]
-  limit: 50
-
-deploy:
-  gguf:
-    enabled: true
-    quantization: q4_k_m
-  ollama:
-    enabled: false
-    model_name: localdistill
-
-logging:
-  level: INFO
-  dir: ./logs
-
-presets:
-  demo:
-    curation:
-      max_examples: 50
-    training:
-      hyperparams:
-        epochs: 1
-  full:
-    curation:
-      max_examples: 5000
-    training:
-      hyperparams:
-        epochs: 3
-```
-
----
-
-## Docker
-
-Docker is optional. Use it if you want containerized runs with NVIDIA Container Toolkit.
-
-### Prerequisites
+**API key** (for teacher/judge):
 
 ```bash
-# Install NVIDIA Container Toolkit
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-
-# Verify
-docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+echo "OPENROUTER_API_KEY=sk-or-v1-xxx" >> .env
 ```
 
-### Running with Docker
+## How It Works
 
-```bash
-# Build images
-docker compose build
+**Preference mode** (current focus):
 
-# Start monitor dashboard
-docker compose up -d monitor
+1. Load preference dataset (UltraFeedback - GPT-4 scored pairs)
+2. Split 90% train / 10% holdout
+3. SFT on "chosen" responses
+4. Evaluate: student vs chosen, judged by teacher LLM
+5. Success = student wins/ties >60%
 
-# Run training
-docker compose run --rm trainer python distill.py run --mode demo
+**On-policy mode** (advanced):
 
-# Run full training with on-policy
-docker compose run --rm trainer python distill.py run --mode full --on-policy
-
-# Stop everything
-docker compose down
-```
-
-### Docker Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| `monitor` | 8080 | Dashboard |
-| `trainer` | - | GPU training container |
-| `proxy` | 8787 | API capture (optional) |
-
----
-
-## CLI Reference
-
-```
-./distill <command> [options]
-
-COMMANDS:
-  setup               Check environment, install dependencies
-  run [options]       Run training pipeline
-  monitor [--fg]      Start dashboard at :8080
-  stop                Stop dashboard
-  status              Show recent runs
-  logs                Tail latest logs
-
-RUN OPTIONS:
-  --mode <mode>       demo | full | custom
-  --student <model>   Override student model
-  --teacher <model>   Override teacher model  
-  --on-policy         Enable on-policy distillation
-  --max-examples <n>  Override max training examples
-  --epochs <n>        Override epochs
-  --steps <steps>     Run specific steps: curate,train,benchmark,deploy
-  --dry-run           Show plan without running
-```
-
-### Examples
-
-```bash
-# Quick demo
-./distill run --mode demo
-
-# Full training
-./distill run --mode full
-
-# Full with on-policy
-./distill run --mode full --on-policy
-
-# Low VRAM
-./distill run --mode demo --student unsloth/Llama-3.2-1B-Instruct
-
-# Custom settings
-./distill run --max-examples 1000 --epochs 2
-
-# Only train (skip benchmark/deploy)
-./distill run --steps curate,train
-
-# Dry run
-./distill run --dry-run
-```
-
----
+1. Collect teacher responses on training prompts
+2. Train with step-decay weighting (earlier turns weighted higher)
+3. Benchmark against base model
 
 ## Troubleshooting
 
-### GPU not detected
-
+**GPU not detected:**
 ```bash
-# Check NVIDIA driver
 nvidia-smi
-
-# Check PyTorch sees GPU
 python3 -c "import torch; print(torch.cuda.is_available())"
 ```
 
-### Out of memory
+**Out of memory:**
+```bash
+./distill run --student unsloth/Llama-3.2-1B-Instruct
+```
 
-Reduce VRAM usage in `config.yaml`:
+Or in config.yaml:
 ```yaml
 training:
   hyperparams:
@@ -535,44 +135,11 @@ training:
     max_seq_length: 1024
 ```
 
-Or use smaller model:
+**View logs:**
 ```bash
-./distill run --student unsloth/Llama-3.2-1B-Instruct
-```
-
-### Training too slow
-
-Use fewer examples:
-```bash
-./distill run --max-examples 100 --epochs 1
-```
-
-### View logs
-
-```bash
-# Latest run logs
 ./distill logs
-
-# All runs
-ls logs/runs/
-
-# Specific run
-cat logs/runs/2024-01-15_abc123/run.log
 ```
-
-### Dashboard not showing data
-
-Check paths:
-```bash
-# Logs should be in
-ls logs/runs/
-
-# Dashboard reads from these
-curl http://localhost:8080/api/runs
-```
-
----
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT
