@@ -207,7 +207,7 @@ presets:
       hyperparams:
         epochs: 3
       save_checkpoints: true
-      checkpoint_steps: 100
+      checkpoint_steps: 10
     benchmark:
       enabled: false
     on_policy:

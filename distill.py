@@ -66,6 +66,7 @@ class DistillPipeline:
         self.adapter_path: Optional[str] = None
         self.dataset_path: Optional[str] = None
         self.holdout_path: Optional[str] = None
+        self.resume_checkpoint: Optional[str] = None
         self.metrics: Dict[str, Any] = {}
     
     def run(self, steps: Optional[List[str]] = None, dry_run: bool = False) -> Dict[str, Any]:
@@ -363,7 +364,18 @@ class DistillPipeline:
         # Train
         self.logger.info(f"Starting training: {len(dataset)} examples, {cfg.hyperparams.epochs} epochs")
         
-        trainer.train()
+        # Check for existing checkpoint to resume from
+        resume_from = None
+        if self.resume_checkpoint:
+            resume_from = self.resume_checkpoint
+        else:
+            # Auto-detect checkpoint in adapter_dir
+            checkpoints = sorted(adapter_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1]))
+            if checkpoints:
+                resume_from = str(checkpoints[-1])
+                self.logger.info(f"Resuming from checkpoint: {resume_from}")
+        
+        trainer.train(resume_from_checkpoint=resume_from)
         
         # Save adapter
         self.logger.info("Saving adapter...")
@@ -971,6 +983,8 @@ def cmd_run(args):
     if resume_adapter:
         pipeline.adapter_path = resume_adapter
         pipeline.dataset_path = str(Path(config.logging.dir).parent / "train.jsonl")
+    if hasattr(args, 'resume_checkpoint') and args.resume_checkpoint:
+        pipeline.resume_checkpoint = args.resume_checkpoint
     result = pipeline.run(steps=steps, dry_run=args.dry_run)
     
     # Print summary
@@ -1131,6 +1145,7 @@ Examples:
     run_parser.add_argument("--steps", help="Comma-separated steps: curate,train,benchmark,deploy")
     run_parser.add_argument("--on-policy", action="store_true", help="Enable on-policy distillation")
     run_parser.add_argument("--resume", help="Resume from adapter path (skips curate+train, runs on_policy+deploy)")
+    run_parser.add_argument("--resume-checkpoint", help="Resume training from checkpoint dir (e.g. adapters/xxx/checkpoint-100)")
     run_parser.add_argument("--dry-run", action="store_true", help="Show plan without executing")
     
     # status command
