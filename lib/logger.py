@@ -1,18 +1,19 @@
 """
 LocalDistill Logging Framework
 
-Provides structured logging with:
-- Console output with colors and progress bars
-- File logging per run
-- JSON event logging for dashboard
-- Real-time log streaming via WebSocket
+Structured logging with:
+- Console output with colors and optional progress display
+- Per-run file logging (plain text + JSONL events)
+- Real-time status.json for dashboard/monitor
+- Automatic GPU stat logging
+- Progress tracking (step-based, not just stage-based)
+- Training step metrics with loss convergence detection
 """
 
 import os
 import sys
 import json
 import logging
-import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Callable
@@ -26,13 +27,15 @@ class LogLevel(Enum):
     INFO = "INFO"
     WARNING = "WARNING"
     ERROR = "ERROR"
-    SUCCESS = "SUCCESS"  # Custom level for completed steps
+    SUCCESS = "SUCCESS"
+    CRITICAL = "CRITICAL"
 
 
 class PipelineStage(Enum):
     INIT = "init"
     CURATE = "curate"
     TRAIN = "train"
+    EVALUATE = "evaluate"
     ON_POLICY = "on_policy"
     BENCHMARK = "benchmark"
     DEPLOY = "deploy"
@@ -42,49 +45,45 @@ class PipelineStage(Enum):
 
 @dataclass
 class LogEvent:
-    """Structured log event for dashboard consumption."""
+    """Structured event for dashboard/events.jsonl."""
     timestamp: str
     level: str
     stage: str
     message: str
     run_id: str
     data: Dict[str, Any] = field(default_factory=dict)
-    
+
     def to_json(self) -> str:
         return json.dumps(asdict(self))
 
 
 @dataclass
 class RunStatus:
-    """Current status of a pipeline run."""
+    """Serializable run state."""
     run_id: str
     stage: PipelineStage
     started_at: str
-    progress: float = 0.0  # 0-100
+    progress: float = 0.0  # 0-100, updated at start of each stage
     current_step: str = ""
     metrics: Dict[str, Any] = field(default_factory=dict)
     logs: List[str] = field(default_factory=list)
     error: Optional[str] = None
     completed_at: Optional[str] = None
+    gpu_info: str = ""
 
 
-# ANSI color codes
+# ── Colors ────────────────────────────────────────────────────────────────────
+
 class Colors:
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
-    
     RED = "\033[31m"
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
     BLUE = "\033[34m"
     MAGENTA = "\033[35m"
     CYAN = "\033[36m"
-    WHITE = "\033[37m"
-    
-    BG_RED = "\033[41m"
-    BG_GREEN = "\033[42m"
-    BG_BLUE = "\033[44m"
 
 
 LEVEL_COLORS = {
@@ -93,12 +92,14 @@ LEVEL_COLORS = {
     LogLevel.WARNING: Colors.YELLOW,
     LogLevel.ERROR: Colors.RED,
     LogLevel.SUCCESS: Colors.GREEN,
+    LogLevel.CRITICAL: Colors.RED + Colors.BOLD,
 }
 
 STAGE_ICONS = {
     PipelineStage.INIT: "🔧",
     PipelineStage.CURATE: "📋",
     PipelineStage.TRAIN: "🏋️",
+    PipelineStage.EVALUATE: "⚖️",
     PipelineStage.ON_POLICY: "🎓",
     PipelineStage.BENCHMARK: "📊",
     PipelineStage.DEPLOY: "🚀",
@@ -107,13 +108,58 @@ STAGE_ICONS = {
 }
 
 
+# ── GPU Helpers ───────────────────────────────────────────────────────────────
+
+def _get_gpu_info() -> str:
+    """Get brief GPU status string."""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            p = [x.strip() for x in r.stdout.split(",")]
+            if len(p) >= 4:
+                return f"T:{p[0]}°C U:{p[1]}% M:{p[2]}MiB P:{p[3]}W"
+        return "gpu-ok"
+    except Exception:
+        return "no-gpu"
+
+
+def _get_loss_trend(metrics_history: List[Dict], window: int = 10) -> Optional[str]:
+    """Analyze recent loss history. Returns: 'improving' | 'plateau' | 'worsening' | 'nan' | None"""
+    if len(metrics_history) < window:
+        return None
+    recent = metrics_history[-window:]
+    losses = [m.get("loss", float('nan')) for m in recent]
+    if any(str(l) == 'nan' for l in losses if isinstance(l, float)):
+        return "nan"
+    # Simple linear regression slope
+    n = len(losses)
+    x_mean = (n - 1) / 2
+    y_mean = sum(losses) / n
+    numerator = sum((i - x_mean) * (losses[i] - y_mean) for i in range(n))
+    denominator = sum((i - x_mean) ** 2 for i in range(n))
+    if denominator == 0:
+        return None
+    slope = numerator / denominator
+    if slope < -0.001:
+        return "improving"
+    elif slope > 0.002:
+        return "worsening"
+    else:
+        return "plateau"
+
+
+# ── Logger ────────────────────────────────────────────────────────────────────
+
 class DistillLogger:
     """
-    Main logger for LocalDistill pipeline.
-    
-    Handles console output, file logging, and event streaming.
+    Structured logger with console + file + event streaming + status tracking.
     """
-    
+
     def __init__(
         self,
         run_id: str,
@@ -127,70 +173,61 @@ class DistillLogger:
         self.level = getattr(logging, level.upper(), logging.INFO)
         self.console_colors = console_colors and sys.stdout.isatty()
         self.console_enabled = console_enabled
-        
+
         self.current_stage = PipelineStage.INIT
         self.started_at = datetime.now(timezone.utc).isoformat()
-        
-        # Event queue for dashboard streaming
+
+        # Event streaming
         self.event_queue: Queue = Queue()
         self.subscribers: List[Callable[[LogEvent], None]] = []
-        
-        # Status tracking
+
+        # Status + history
         self.status = RunStatus(
             run_id=run_id,
             stage=PipelineStage.INIT,
             started_at=self.started_at,
         )
-        
-        # Setup logging directories
+        self.metrics_history: List[Dict] = []  # For trend analysis
+        self._last_progress_update = 0
+
+        # Setup dirs and files
         self._setup_directories()
-        
-        # Setup file handlers
         self._setup_file_logging()
-    
+
     def _setup_directories(self):
-        """Create log directories."""
         self.run_dir = self.log_dir / "runs" / f"{datetime.now().strftime('%Y-%m-%d')}_{self.run_id[:8]}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create stage-specific log files
         self.log_files = {
             "main": self.run_dir / "run.log",
             "events": self.run_dir / "events.jsonl",
             "curate": self.run_dir / "curate.log",
             "train": self.run_dir / "train.log",
+            "evaluate": self.run_dir / "evaluate.log",
             "benchmark": self.run_dir / "benchmark.log",
             "deploy": self.run_dir / "deploy.log",
         }
-    
+
     def _setup_file_logging(self):
-        """Setup Python logging handlers."""
-        self.logger = logging.getLogger(f"distill.{self.run_id[:8]}")
-        self.logger.setLevel(self.level)
-        self.logger.handlers.clear()
-        
-        # Main log file
-        file_handler = logging.FileHandler(self.log_files["main"])
-        file_handler.setFormatter(logging.Formatter(
+        self._pylogger = logging.getLogger(f"distill.{self.run_id[:8]}")
+        self._pylogger.setLevel(self.level)
+        self._pylogger.handlers.clear()
+        fh = logging.FileHandler(self.log_files["main"])
+        fh.setFormatter(logging.Formatter(
             '%(asctime)s [%(levelname)s] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         ))
-        self.logger.addHandler(file_handler)
-    
+        self._pylogger.addHandler(fh)
+
     def _format_console(self, level: LogLevel, stage: PipelineStage, message: str) -> str:
-        """Format message for console output."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        
+        ts = datetime.now().strftime("%H:%M:%S")
         if self.console_colors:
             color = LEVEL_COLORS.get(level, "")
             icon = STAGE_ICONS.get(stage, "")
             stage_str = f"{Colors.BOLD}[{stage.value:^10}]{Colors.RESET}"
-            return f"{Colors.DIM}{timestamp}{Colors.RESET} {icon} {stage_str} {color}{message}{Colors.RESET}"
-        else:
-            return f"{timestamp} [{stage.value:^10}] {message}"
-    
+            return f"{Colors.DIM}{ts}{Colors.RESET} {icon} {stage_str} {color}{message}{Colors.RESET}"
+        return f"{ts} [{stage.value:^10}] {message}"
+
     def _emit_event(self, level: LogLevel, message: str, data: Dict[str, Any] = None):
-        """Emit a log event for dashboard consumption."""
         event = LogEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),
             level=level.value,
@@ -199,116 +236,137 @@ class DistillLogger:
             run_id=self.run_id,
             data=data or {},
         )
-        
-        # Write to events file
         with open(self.log_files["events"], "a") as f:
             f.write(event.to_json() + "\n")
-        
-        # Add to status logs (keep last 100)
+
+        # Keep last 100 logs in status
         self.status.logs.append(f"[{event.timestamp}] {message}")
         if len(self.status.logs) > 100:
             self.status.logs = self.status.logs[-100:]
-        
-        # Notify subscribers
+
         for subscriber in self.subscribers:
             try:
                 subscriber(event)
             except Exception:
                 pass
-        
-        # Put in queue for streaming
         self.event_queue.put(event)
-    
+
     def log(self, level: LogLevel, message: str, data: Dict[str, Any] = None):
-        """Log a message at the specified level."""
-        # Console output
         if self.console_enabled:
             print(self._format_console(level, self.current_stage, message))
-        
-        # File logging
-        log_level = getattr(logging, level.value, logging.INFO)
-        self.logger.log(log_level, f"[{self.current_stage.value}] {message}")
-        
-        # Event emission
+
+        py_level = getattr(logging, level.value, logging.INFO)
+        self._pylogger.log(py_level, f"[{self.current_stage.value}] {message}")
         self._emit_event(level, message, data)
-    
+
     def debug(self, message: str, **data):
         self.log(LogLevel.DEBUG, message, data)
-    
+
     def info(self, message: str, **data):
         self.log(LogLevel.INFO, message, data)
-    
+
     def warning(self, message: str, **data):
         self.log(LogLevel.WARNING, message, data)
-    
+
     def error(self, message: str, **data):
         self.log(LogLevel.ERROR, message, data)
-    
+
     def success(self, message: str, **data):
         self.log(LogLevel.SUCCESS, message, data)
-    
+
+    def critical(self, message: str, **data):
+        self.log(LogLevel.CRITICAL, message, data)
+
     def set_stage(self, stage: PipelineStage):
-        """Update the current pipeline stage."""
+        """Update pipeline stage and reset progress."""
         self.current_stage = stage
         self.status.stage = stage
+        self.status.progress = 0.0
+        self.status.current_step = ""
+        self.status.gpu_info = _get_gpu_info()
         self.info(f"Entering stage: {stage.value}")
-        self._save_status()  # Save status on every stage change
-    
+        self._save_status()
+
     def set_progress(self, progress: float, step: str = ""):
-        """Update progress (0-100) and current step."""
-        self.status.progress = progress
+        """Update progress (0-100) and current step. Save status periodically."""
+        self.status.progress = min(100.0, max(0.0, progress))
         self.status.current_step = step
-        self._emit_event(LogLevel.INFO, f"Progress: {progress:.1f}% - {step}", {
-            "progress": progress,
-            "step": step,
-        })
-        self._save_status()  # Save status on progress update
-    
+        self.status.gpu_info = _get_gpu_info()
+        now = datetime.now(timezone.utc).timestamp()
+        # Save status at most every 5 seconds to avoid excessive I/O
+        if now - self._last_progress_update >= 5.0:
+            self._emit_event(LogLevel.INFO, f"Progress: {progress:.1f}% - {step}", {
+                "progress": progress,
+                "step": step,
+            })
+            self._save_status()
+            self._last_progress_update = now
+
+    def log_training_step(self, step: int, loss: float, lr: float = None, **extra):
+        """Log a training step, detect NaN, track trends, update progress."""
+        metrics = {"step": step, "loss": loss}
+        if lr is not None:
+            metrics["lr"] = lr
+        metrics.update(extra)
+
+        self.status.metrics.update(metrics)
+        self.metrics_history.append(metrics.copy())
+
+        # NaN / explosion detection
+        if loss != loss:  # NaN check
+            self.critical(f"Step {step}: LOSS IS NaN! Training broken.", **metrics)
+            return
+        if loss > 50.0:
+            self.error(f"Step {step}: Loss exploded ({loss:.2f}). Check LR or data.", **metrics)
+
+        # Trend detection (every 10 steps)
+        trend = None
+        if step % 10 == 0:
+            trend = _get_loss_trend(self.metrics_history, window=20)
+            if trend == "plateau":
+                self.warning(f"Step {step}: Loss plateau detected (last 20 steps)", **metrics)
+            elif trend == "worsening":
+                self.error(f"Step {step}: Loss increasing over last 20 steps", **metrics)
+
+        # Format for console (throttle: every N steps based on config)
+        msg = f"Step {step}: loss={loss:.4f}"
+        if lr:
+            msg += f", lr={lr:.2e}"
+        if trend:
+            msg += f" [{trend}]"
+
+        if step % self._log_every_n == 0:
+            self.debug(msg, **metrics)
+
+        # Update progress in TRAIN stage
+        if self.current_stage == PipelineStage.TRAIN:
+            total_steps = extra.get("total_steps")
+            if total_steps and total_steps > 0:
+                progress = (step / total_steps) * 100
+                self.set_progress(progress, f"step {step}/{total_steps}")
+            self._save_status()
+
     def log_metric(self, name: str, value: Any):
-        """Log a training metric."""
         self.status.metrics[name] = value
         self._emit_event(LogLevel.INFO, f"Metric: {name}={value}", {
             "metric_name": name,
             "metric_value": value,
         })
-    
-    def log_training_step(self, step: int, loss: float, lr: float = None, **extra):
-        """Log a training step with metrics."""
-        metrics = {"step": step, "loss": loss}
-        if lr is not None:
-            metrics["lr"] = lr
-        metrics.update(extra)
-        
-        self.status.metrics.update(metrics)
-        
-        # Format for console
-        msg = f"Step {step}: loss={loss:.4f}"
-        if lr:
-            msg += f", lr={lr:.2e}"
-        
-        self.debug(msg, **metrics)
-        
-        # Save status periodically (every 10 steps to avoid too many writes)
-        if step % 10 == 0:
-            self._save_status()
-    
+
     def complete(self, message: str = "Pipeline completed successfully"):
-        """Mark pipeline as complete."""
         self.status.completed_at = datetime.now(timezone.utc).isoformat()
         self.set_stage(PipelineStage.COMPLETE)
         self.success(message)
         self._save_status()
-    
+
     def fail(self, error: str):
-        """Mark pipeline as failed."""
         self.status.error = error
         self.status.completed_at = datetime.now(timezone.utc).isoformat()
         self.set_stage(PipelineStage.FAILED)
         self.error(f"Pipeline failed: {error}")
         self._save_status()
-    
+
     def _save_status(self):
-        """Save current status to file."""
         status_file = self.run_dir / "status.json"
         with open(status_file, "w") as f:
             json.dump({
@@ -316,32 +374,31 @@ class DistillLogger:
                 "stage": self.status.stage.value,
                 "started_at": self.status.started_at,
                 "completed_at": self.status.completed_at,
-                "progress": self.status.progress,
+                "progress": round(self.status.progress, 1),
                 "current_step": self.status.current_step,
                 "metrics": self.status.metrics,
                 "error": self.status.error,
-            }, f, indent=2)
-    
+                "gpu_info": self.status.gpu_info,
+            }, f, indent=2, default=str)
+
     def get_status(self) -> Dict[str, Any]:
-        """Get current status as dict."""
         return {
             "run_id": self.status.run_id,
             "stage": self.status.stage.value,
             "started_at": self.status.started_at,
             "completed_at": self.status.completed_at,
-            "progress": self.status.progress,
+            "progress": round(self.status.progress, 1),
             "current_step": self.status.current_step,
             "metrics": self.status.metrics,
             "error": self.status.error,
+            "gpu_info": self.status.gpu_info,
             "log_dir": str(self.run_dir),
         }
-    
+
     def subscribe(self, callback: Callable[[LogEvent], None]):
-        """Subscribe to log events."""
         self.subscribers.append(callback)
-    
+
     def header(self, title: str):
-        """Print a section header."""
         if self.console_enabled:
             width = 60
             if self.console_colors:
@@ -353,24 +410,30 @@ class DistillLogger:
                 print(f"  {title}")
                 print(f"{'═' * width}\n")
 
+    @property
+    def _log_every_n(self) -> int:
+        # Throttle console logging: every 1 step at first 50, then every 10
+        last_step = self.status.metrics.get("step", 0)
+        if last_step < 50:
+            return 1
+        return 10
 
-# Global logger instance (set by orchestrator)
+
+# ── Global instance ───────────────────────────────────────────────────────────
+
 _logger: Optional[DistillLogger] = None
 
 
 def get_logger() -> Optional[DistillLogger]:
-    """Get the global logger instance."""
     return _logger
 
 
 def set_logger(logger: DistillLogger):
-    """Set the global logger instance."""
     global _logger
     _logger = logger
 
 
 def create_logger(run_id: str, config) -> DistillLogger:
-    """Create and set the global logger from config."""
     logger = DistillLogger(
         run_id=run_id,
         log_dir=config.logging.dir,
@@ -380,60 +443,3 @@ def create_logger(run_id: str, config) -> DistillLogger:
     )
     set_logger(logger)
     return logger
-
-
-class ProgressBar:
-    """Simple progress bar for console output."""
-    
-    def __init__(self, total: int, desc: str = "", width: int = 40, enabled: bool = True):
-        self.total = total
-        self.desc = desc
-        self.width = width
-        self.enabled = enabled and sys.stdout.isatty()
-        self.current = 0
-    
-    def update(self, n: int = 1):
-        self.current += n
-        if self.enabled:
-            self._render()
-    
-    def _render(self):
-        pct = self.current / self.total if self.total > 0 else 0
-        filled = int(self.width * pct)
-        bar = "█" * filled + "░" * (self.width - filled)
-        print(f"\r{self.desc}: [{bar}] {self.current}/{self.total} ({pct*100:.1f}%)", end="", flush=True)
-    
-    def close(self):
-        if self.enabled:
-            print()  # Newline after progress bar
-
-
-if __name__ == "__main__":
-    # Test the logger
-    import uuid
-    
-    logger = DistillLogger(
-        run_id=str(uuid.uuid4()),
-        log_dir="./logs",
-        level="DEBUG",
-    )
-    
-    logger.header("LOCALDISTILL TEST RUN")
-    
-    logger.set_stage(PipelineStage.INIT)
-    logger.info("Initializing pipeline")
-    
-    logger.set_stage(PipelineStage.CURATE)
-    logger.info("Loading dataset", examples=1000)
-    logger.set_progress(50, "Filtering examples")
-    
-    logger.set_stage(PipelineStage.TRAIN)
-    for i in range(5):
-        logger.log_training_step(i, loss=1.0 - i * 0.1, lr=2e-4)
-    
-    logger.set_stage(PipelineStage.BENCHMARK)
-    logger.log_metric("gsm8k_accuracy", 0.65)
-    
-    logger.complete()
-    
-    print("\nStatus:", json.dumps(logger.get_status(), indent=2))
