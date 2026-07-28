@@ -2,11 +2,14 @@
 LocalDistill Configuration Loader
 
 Loads and validates config.yaml, applies presets, and provides typed access.
-All new training strategies, judge modes, and monitoring options are configurable here.
+
+Model: one method selector (`training.method: sft | reopd | dpo | orpo | kto`).
+Each method is an explicit chain of stages (see METHODS). There are no hidden
+enable flags — if a stage is in the chain it runs, unless its output already
+exists (resume).
 """
 
 import os
-import sys
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -23,6 +26,27 @@ def deep_merge(base: dict, override: dict) -> dict:
         else:
             result[key] = deepcopy(value)
     return result
+
+
+# ── Methods ───────────────────────────────────────────────────────────────────
+# Each method declares its full stage chain. Stages are filtered at runtime by
+# config (e.g. evaluate only for preference datasets, generate only when
+# generate_teacher=true). Adding a new training method = add an entry here and
+# implement its stages in distill.py.
+
+METHODS: Dict[str, List[str]] = {
+    # Supervised fine-tuning on curated data (optionally on teacher completions)
+    "sft": ["curate", "generate", "train", "evaluate", "benchmark", "deploy"],
+    # ReOPD: replay-based policy distillation with per-turn decay weighting
+    "reopd": ["curate", "collect", "weight", "train", "evaluate", "benchmark", "deploy"],
+    # Preference methods (dataset.source must be "preference"):
+    "dpo": ["curate", "train", "evaluate", "benchmark", "deploy"],   # Rafailov et al. 2023
+    "orpo": ["curate", "train", "evaluate", "benchmark", "deploy"],  # Hong et al. 2024, no ref model
+    "kto": ["curate", "train", "evaluate", "benchmark", "deploy"],   # Ethayarajh et al. 2024
+}
+
+# Methods that train on chosen/rejected pairs (curate exports pairs.jsonl)
+PREFERENCE_METHODS = {"dpo", "orpo", "kto"}
 
 
 # ── Config Dataclasses ────────────────────────────────────────────────────────
@@ -52,42 +76,19 @@ class HyperparamsConfig:
 
 @dataclass
 class CheckpointConfig:
-    """Checkpoint behavior."""
-    enabled: bool = False
+    """HF-native checkpointing during training (enables true resume)."""
+    enabled: bool = True
     steps: int = 100          # Save every N steps
-    keep_last: int = 2        # Keep only last N checkpoints (disk space)
-    save_final: bool = True   # Always save final adapter on completion
+    keep_last: int = 2        # Keep only last N checkpoints
 
 
 @dataclass
 class EarlyStoppingConfig:
-    """Stop training if loss stops improving."""
+    """Stop training if eval loss stops improving. Uses a small holdout split."""
     enabled: bool = False
-    patience: int = 50        # Steps without improvement before stopping
-    min_delta: float = 0.001  # Improvement threshold
-    monitor: str = "loss"     # Metric to watch
-    mode: str = "min"         # "min" or "max"
-
-
-@dataclass
-class DatasetMixConfig:
-    """Blend multiple dataset sources for training."""
-    curated: float = 1.0      # train.jsonl (preference chosen or curated)
-    teacher_pool: float = 0.0 # teacher_pool.jsonl (on-policy phase 1)
-    on_policy_weighted: float = 0.0  # on_policy_weighted.jsonl
-    # Normalized to sum=1 at load time
-
-
-@dataclass
-class TrainingStrategyConfig:
-    """Which training algorithm to use."""
-    name: str = "sft"         # sft | dpo | on_policy | spin
-    # SFT: standard supervised fine-tuning on chosen responses
-    # DPO: direct preference optimization (uses rejected pairs too)
-    # On-policy: ReOPD (replay-based offline policy distillation)
-    # SPIN: synthetic preference injection (future)
-    dataset_source: str = "auto"  # auto | curated | teacher_pool | on_policy_weighted
-    # "auto" = use teacher_pool if exists AND strategy=on_policy, else curated
+    patience: int = 3         # Evals without improvement before stopping
+    min_delta: float = 0.001
+    eval_fraction: float = 0.02  # Fraction of train data used for eval loss
 
 
 @dataclass
@@ -95,20 +96,41 @@ class JudgeConfig:
     """Evaluation judge selection."""
     mode: str = "heuristic"   # heuristic | llm | human
     llm_model: str = "openrouter/deepseek/deepseek-chat"
-    max_examples: int = 50    # Limit eval examples (LLM judge costs money)
-    win_rate_target: float = 0.6  # Success gate: >60%
+    max_examples: int = 50
+    win_rate_target: float = 0.6
 
 
 @dataclass
 class TrainingConfig:
+    method: str = "sft"       # sft | reopd (see METHODS)
+    generate_teacher: bool = False  # SFT only: generate teacher completions first
     lora: LoraConfig = field(default_factory=LoraConfig)
     hyperparams: HyperparamsConfig = field(default_factory=HyperparamsConfig)
-    strategy: TrainingStrategyConfig = field(default_factory=TrainingStrategyConfig)
-    dataset_mix: DatasetMixConfig = field(default_factory=DatasetMixConfig)
     quantization: str = "4bit"
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
+
+
+@dataclass
+class ReopdConfig:
+    """ReOPD method settings (used only when training.method=reopd)."""
+    kappa: float = 0.9            # Per-turn exponential decay: weight = kappa^turn
+    epochs: int = 1               # Reopd train phase epochs
+    lr_scale: float = 0.5         # Reopd LR = base LR * lr_scale
+    max_teacher_tokens: int = 512 # Per-turn teacher completion budget
+
+
+@dataclass
+class PreferenceConfig:
+    """Shared settings for dpo/orpo/kto."""
+    beta: float = 0.1             # DPO/KTO beta; ORPO odds-ratio weight
+    lr_scale: float = 1.0         # Method LR = base LR * lr_scale
+    epochs: int = 1
+    max_prompt_length: int = 1024
+    # DPO on small GPUs: precompute reference log probs in a single pass
+    # instead of keeping a second (reference) model resident.
+    precompute_ref_log_probs: bool = True
 
 
 @dataclass
@@ -140,7 +162,7 @@ class HuggingFaceConfig:
 
 @dataclass
 class DatasetConfig:
-    source: str = "file"
+    source: str = "file"          # file | huggingface | preference
     path: str = "./curated_train.jsonl"
     huggingface: HuggingFaceConfig = field(default_factory=HuggingFaceConfig)
     format: str = "chatml"
@@ -151,14 +173,9 @@ class DatasetConfig:
 class ModelsConfig:
     student: str = "unsloth/Llama-3.2-3B-Instruct"
     teacher: str = "openrouter/deepseek/deepseek-chat"
-
-
-@dataclass
-class OnPolicyConfig:
-    enabled: bool = False
-    teacher_query_interval: int = 10
-    decay_function: str = "linear"
-    exponential_lambda: float = 0.9
+    # Concurrent teacher API calls (collect/generate stages). Calls within a
+    # conversation stay sequential; conversations run in parallel.
+    teacher_concurrency: int = 8
 
 
 @dataclass
@@ -166,7 +183,6 @@ class BenchmarkConfig:
     enabled: bool = True
     tasks: List[str] = field(default_factory=lambda: ["gsm8k"])
     limit: Optional[int] = 50
-    compare_base: bool = True
     device: str = "auto"
 
 
@@ -180,7 +196,6 @@ class GGUFConfig:
 class OllamaConfig:
     enabled: bool = False
     model_name: str = "localdistill"
-    auto_register: bool = True
 
 
 @dataclass
@@ -228,7 +243,8 @@ class Config:
     models: ModelsConfig = field(default_factory=ModelsConfig)
     curation: CurationConfig = field(default_factory=CurationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    on_policy: OnPolicyConfig = field(default_factory=OnPolicyConfig)
+    reopd: ReopdConfig = field(default_factory=ReopdConfig)
+    preference: PreferenceConfig = field(default_factory=PreferenceConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     deploy: DeployConfig = field(default_factory=DeployConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -244,10 +260,10 @@ class Config:
 
 def _build_training_config(data: dict) -> TrainingConfig:
     return TrainingConfig(
+        method=data.get("method", "sft"),
+        generate_teacher=data.get("generate_teacher", False),
         lora=_dict_to_dataclass(LoraConfig, data.get("lora", {})),
         hyperparams=_dict_to_dataclass(HyperparamsConfig, data.get("hyperparams", {})),
-        strategy=_dict_to_dataclass(TrainingStrategyConfig, data.get("strategy", {})),
-        dataset_mix=_dict_to_dataclass(DatasetMixConfig, data.get("dataset_mix", {})),
         quantization=data.get("quantization", "4bit"),
         checkpoint=_dict_to_dataclass(CheckpointConfig, data.get("checkpoint", {})),
         early_stopping=_dict_to_dataclass(EarlyStoppingConfig, data.get("early_stopping", {})),
@@ -302,50 +318,62 @@ def _expand_env_vars(obj):
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-VALID_STRATEGIES = {"sft", "dpo", "on_policy", "spin"}
 VALID_JUDGES = {"heuristic", "llm", "human"}
 VALID_LR_SCHEDULERS = {"linear", "cosine", "constant", "cosine_with_restarts"}
+VALID_SOURCES = {"file", "huggingface", "preference"}
 
 
-def validate_config(config: Config) -> list[str]:
-    """Return list of warnings/errors. Empty list = valid."""
+def validate_config(config: Config) -> List[str]:
+    """Return list of errors. Empty list = valid."""
     errs = []
 
-    if config.training.strategy.name not in VALID_STRATEGIES:
-        errs.append(f"Unknown strategy '{config.training.strategy.name}'. Valid: {VALID_STRATEGIES}")
+    if config.training.method not in METHODS:
+        errs.append(f"Unknown method '{config.training.method}'. Valid: {sorted(METHODS)}")
 
-    if config.training.strategy.dataset_source not in {"auto", "curated", "teacher_pool", "on_policy_weighted"}:
-        errs.append(f"Unknown dataset_source '{config.training.strategy.dataset_source}'")
+    if config.dataset.source not in VALID_SOURCES:
+        errs.append(f"Unknown dataset.source '{config.dataset.source}'. Valid: {sorted(VALID_SOURCES)}")
 
-    if config.training.hyperparams.epochs <= 0:
-        errs.append(f"epochs={config.training.hyperparams.epochs} must be > 0")
-    if config.training.hyperparams.learning_rate <= 0:
-        errs.append(f"learning_rate={config.training.hyperparams.learning_rate} must be > 0")
-    if config.training.hyperparams.batch_size <= 0:
-        errs.append(f"batch_size={config.training.hyperparams.batch_size} must be > 0")
-    if config.training.hyperparams.warmup_steps < 0:
-        errs.append(f"warmup_steps={config.training.hyperparams.warmup_steps} must be >= 0")
+    h = config.training.hyperparams
+    if h.epochs <= 0:
+        errs.append(f"epochs={h.epochs} must be > 0")
+    if h.learning_rate <= 0:
+        errs.append(f"learning_rate={h.learning_rate} must be > 0")
+    if h.batch_size <= 0:
+        errs.append(f"batch_size={h.batch_size} must be > 0")
+    if h.warmup_steps < 0:
+        errs.append(f"warmup_steps={h.warmup_steps} must be >= 0")
+    if h.lr_scheduler not in VALID_LR_SCHEDULERS:
+        errs.append(f"Unknown lr_scheduler '{h.lr_scheduler}'")
 
-    if config.training.hyperparams.lr_scheduler not in VALID_LR_SCHEDULERS:
-        errs.append(f"Unknown lr_scheduler '{config.training.hyperparams.lr_scheduler}'")
+    r = config.reopd
+    if not (0.0 < r.kappa <= 1.0):
+        errs.append(f"reopd.kappa={r.kappa} must be in (0, 1]")
+    if r.epochs <= 0:
+        errs.append(f"reopd.epochs={r.epochs} must be > 0")
+    if r.lr_scale <= 0:
+        errs.append(f"reopd.lr_scale={r.lr_scale} must be > 0")
 
-    mix = config.training.dataset_mix
-    total = mix.curated + mix.teacher_pool + mix.on_policy_weighted
-    if total <= 0 and config.training.strategy.name == "sft":
-        errs.append("dataset_mix sums to <= 0 — no training data selected")
-    if total > 0 and abs(total - 1.0) > 0.01:
-        errs.append(f"dataset_mix sums to {total:.2f} (should be ~1.0)")
+    pref = config.preference
+    if pref.beta <= 0:
+        errs.append(f"preference.beta={pref.beta} must be > 0")
+    if pref.lr_scale <= 0:
+        errs.append(f"preference.lr_scale={pref.lr_scale} must be > 0")
 
-    # DPO requires preference dataset
-    if config.training.strategy.name == "dpo" and config.dataset.source != "preference":
-        errs.append("Strategy 'dpo' requires dataset.source='preference' (needs rejected pairs)")
+    if config.training.method in PREFERENCE_METHODS and config.dataset.source != "preference":
+        errs.append(f"method={config.training.method} requires dataset.source='preference' (chosen/rejected pairs)")
+
+    if config.training.judge.mode not in VALID_JUDGES:
+        errs.append(f"Unknown judge mode '{config.training.judge.mode}'")
+
+    if not (1 <= config.models.teacher_concurrency <= 64):
+        errs.append(f"teacher_concurrency={config.models.teacher_concurrency} must be in [1, 64]")
 
     return errs
 
 
 # ── Loader ────────────────────────────────────────────────────────────────────
 
-def load_config(config_path: Optional[str] = None) -> Config:
+def load_config(config_path: Optional[str] = None, run_mode: Optional[str] = None) -> Config:
     if config_path is None:
         for p in [Path.cwd() / "config.yaml", Path(__file__).parent.parent / "config.yaml", Path.home() / "localdistill" / "config.yaml"]:
             if p.exists():
@@ -359,26 +387,23 @@ def load_config(config_path: Optional[str] = None) -> Config:
     with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
 
-    # Apply preset
-    run_mode = raw.get("run_mode", "demo")
+    # Apply preset (CLI --mode overrides the yaml run_mode)
     presets = raw.get("presets", {})
-    if run_mode in presets:
-        preset = presets[run_mode]
-        for key, value in preset.items():
-            if key in raw and isinstance(raw[key], dict) and isinstance(value, dict):
-                raw[key] = deep_merge(raw[key], value)
-            else:
-                raw[key] = value
+    mode = run_mode or raw.get("run_mode", "demo")
+    if mode in presets:
+        raw = deep_merge(raw, presets[mode])
+    raw["run_mode"] = mode
 
     raw = _expand_env_vars(raw)
 
     config = Config(
-        run_mode=raw.get("run_mode", "demo"),
+        run_mode=mode,
         dataset=_dict_to_dataclass(DatasetConfig, raw.get("dataset", {})),
         models=_dict_to_dataclass(ModelsConfig, raw.get("models", {})),
         curation=_dict_to_dataclass(CurationConfig, raw.get("curation", {})),
         training=_build_training_config(raw.get("training", {})),
-        on_policy=_dict_to_dataclass(OnPolicyConfig, raw.get("on_policy", {})),
+        reopd=_dict_to_dataclass(ReopdConfig, raw.get("reopd", {})),
+        preference=_dict_to_dataclass(PreferenceConfig, raw.get("preference", {})),
         benchmark=_dict_to_dataclass(BenchmarkConfig, raw.get("benchmark", {})),
         deploy=_build_deploy_config(raw.get("deploy", {})),
         logging=_build_logging_config(raw.get("logging", {})),
@@ -391,62 +416,6 @@ def load_config(config_path: Optional[str] = None) -> Config:
         config.dataset.huggingface = _dict_to_dataclass(HuggingFaceConfig, raw["dataset"]["huggingface"])
 
     return config
-
-
-def _apply_preset(config: Config, preset: dict):
-    """Apply a preset dict to config object (used by CLI)."""
-    for key, value in preset.items():
-        if key == "dataset" and isinstance(value, dict):
-            for dk, dv in value.items():
-                if dk == "huggingface" and isinstance(dv, dict):
-                    for hk, hv in dv.items():
-                        setattr(config.dataset.huggingface, hk, hv)
-                else:
-                    setattr(config.dataset, dk, dv)
-        elif key == "curation" and isinstance(value, dict):
-            for ck, cv in value.items():
-                if ck == "filters" and isinstance(cv, dict):
-                    config.curation.filters.update(cv)
-                else:
-                    setattr(config.curation, ck, cv)
-        elif key == "training" and isinstance(value, dict):
-            for tk, tv in value.items():
-                if tk == "hyperparams" and isinstance(tv, dict):
-                    for hk, hv in tv.items():
-                        setattr(config.training.hyperparams, hk, hv)
-                elif tk == "lora" and isinstance(tv, dict):
-                    for lk, lv in tv.items():
-                        setattr(config.training.lora, lk, lv)
-                elif tk == "strategy" and isinstance(tv, dict):
-                    for sk, sv in tv.items():
-                        setattr(config.training.strategy, sk, sv)
-                elif tk == "checkpoint" and isinstance(tv, dict):
-                    for ck, cv in tv.items():
-                        setattr(config.training.checkpoint, ck, cv)
-                elif tk == "early_stopping" and isinstance(tv, dict):
-                    for ek, ev in tv.items():
-                        setattr(config.training.early_stopping, ek, ev)
-                elif tk == "judge" and isinstance(tv, dict):
-                    for jk, jv in tv.items():
-                        setattr(config.training.judge, jk, jv)
-                elif tk == "dataset_mix" and isinstance(tv, dict):
-                    for mk, mv in tv.items():
-                        setattr(config.training.dataset_mix, mk, mv)
-                else:
-                    setattr(config.training, tk, tv)
-        elif key == "on_policy" and isinstance(value, dict):
-            for ok, ov in value.items():
-                setattr(config.on_policy, ok, ov)
-        elif key == "benchmark" and isinstance(value, dict):
-            for bk, bv in value.items():
-                setattr(config.benchmark, bk, bv)
-        elif key == "deploy" and isinstance(value, dict):
-            if "gguf" in value:
-                for gk, gv in value["gguf"].items():
-                    setattr(config.deploy.gguf, gk, gv)
-            if "ollama" in value:
-                for ok, ov in value["ollama"].items():
-                    setattr(config.deploy.ollama, ok, ov)
 
 
 # ── Serialization ─────────────────────────────────────────────────────────────
@@ -471,14 +440,13 @@ def save_config(config: Config, path: str):
         yaml.dump(to_dict(config), f, default_flow_style=False, sort_keys=False)
 
 
-def print_config(config: Config):
+def print_config(config: Config, paths: Optional[Dict[str, Path]] = None):
     """Pretty print configuration."""
     print("\n" + "=" * 60)
     print("  LOCALDISTILL CONFIGURATION")
     print("=" * 60)
     print(f"  Run mode:      {config.run_mode}")
-    print(f"  Strategy:      {config.training.strategy.name}")
-    print(f"  Dataset src:   {config.training.strategy.dataset_source}")
+    print(f"  Method:        {config.training.method}")
     print(f"  Config file:   {config.config_path}")
     print()
     print(f"  Dataset:       {config.dataset.source}")
@@ -495,12 +463,20 @@ def print_config(config: Config):
     print(f"  LoRA rank:     {config.training.lora.rank}")
     print(f"  Learning rate: {config.training.hyperparams.learning_rate}")
     print(f"  LR scheduler:  {config.training.hyperparams.lr_scheduler}")
+    if config.training.method == "sft":
+        print(f"  Gen teacher:   {config.training.generate_teacher}")
+    else:
+        print(f"  ReOPD:         kappa={config.reopd.kappa}, epochs={config.reopd.epochs}, lr_scale={config.reopd.lr_scale}")
     print()
     print(f"  Checkpoint:    {config.training.checkpoint.enabled} (every {config.training.checkpoint.steps} steps)")
-    print(f"  Early stop:    {config.training.early_stopping.enabled} (patience={config.training.early_stopping.patience})")
-    print()
-    print(f"  On-policy:     {config.on_policy.enabled}")
+    print(f"  Early stop:    {config.training.early_stopping.enabled}")
     print(f"  Benchmark:     {config.benchmark.enabled} ({', '.join(config.benchmark.tasks)})")
-    print(f"  Judge:         {config.deploy.gguf.enabled}")
+    print(f"  Judge:         {config.training.judge.mode}")
+    print(f"  Deploy GGUF:   {config.deploy.gguf.enabled}")
     print(f"  Deploy Ollama: {config.deploy.ollama.enabled}")
+    if paths:
+        print()
+        print("  Artifacts:")
+        for name, p in paths.items():
+            print(f"    {name:16s} {p}")
     print("=" * 60 + "\n")

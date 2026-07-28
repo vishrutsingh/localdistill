@@ -1,14 +1,21 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# LocalDistill Configuration — V2
+# LocalDistill Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Training strategy, checkpointing, early stopping, judge selection,
-# and dataset mixing are now fully configurable.
+# One method selector: training.method = sft | reopd | dpo | orpo | kto
+#   sft:   curate → [generate] → train → evaluate → benchmark → deploy
+#   reopd: curate → collect → weight → train → evaluate → benchmark → deploy
+#   dpo / orpo / kto: curate → train → evaluate → benchmark → deploy
+#          (preference methods; require dataset.source: preference)
+#
+# Artifacts are content-addressed under data/ and adapters/ — rerunning the
+# same command resumes automatically. Use --force to redo.
 #
 # Quick start:
-#   ./distill run --mode demo           # 50 examples, 1 epoch (fast test)
-#   ./distill run --mode preference     # SFT on UltraFeedback, 5k/3ep
-#   ./distill run --mode preference --on-policy  # Two-phase ReOPD
+#   ./distill run --method sft --mode demo          # fast test (10 examples, 1 epoch)
+#   ./distill run --method sft --mode preference    # SFT on UltraFeedback, 5k/3ep
+#   ./distill run --method reopd --mode preference  # ReOPD from base model
+#   ./distill run --method reopd --from-adapter latest  # ReOPD on top of last SFT
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -18,23 +25,22 @@ run_mode: demo
 models:
   student: unsloth/Llama-3.2-3B-Instruct
   teacher: openrouter/deepseek/deepseek-chat
+  # Concurrent teacher API calls for collect/generate (conversations run in
+  # parallel, turns within a conversation stay sequential). Lower if you hit
+  # rate limits, raise if your plan allows.
+  teacher_concurrency: 8
 
 # ── Data Source ───────────────────────────────────────────────────────────────
 dataset:
-  source: file
+  source: file                # file | huggingface | preference
   path: ./curated_train.jsonl
   format: chatml
-  holdout_ratio: 0.1
+  holdout_ratio: 0.1          # preference only: fraction reserved for evaluation
 
   huggingface:
     dataset_id: RyokoAI/ShareGPT52K
     split: train
     config: null
-
-  # For preference datasets (evaluated: HuggingFaceH4/ultrafeedback_binarized)
-  preference:
-    dataset_id: HuggingFaceH4/ultrafeedback_binarized
-    split: train_prefs
 
 # ── Curation Filters ──────────────────────────────────────────────────────────
 curation:
@@ -47,29 +53,15 @@ curation:
     max_chars: 50000
     exclude_code_heavy: false
 
-# ── Training Configuration ────────────────────────────────────────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 training:
-  # Training strategy: sft | dpo | on_policy | spin
-  #   sft:  Standard supervised fine-tuning on chosen responses (simple, fast)
-  #   dpo:  Direct preference optimization (uses rejected pairs too) — not yet implemented
-  #   on_policy: ReOPD — collect teacher trajectories, replay with decay weighting
-  #   spin: Synthetic preference injection — future
-  strategy:
-    name: sft
-    # Dataset source: auto | curated | teacher_pool | on_policy_weighted
-    #   auto: Let the pipeline decide based on strategy name
-    #   curated: Always use train.jsonl (chosen responses)
-    #   teacher_pool: Use teacher_pool.jsonl (teacher-generated responses)
-    #   on_policy_weighted: Use on_policy_weighted.jsonl (decay-weighted)
-    dataset_source: auto
+  method: sft                 # sft | reopd | dpo | orpo | kto
 
-  # Mix multiple dataset sources (ratios sum to ~1.0)
-  dataset_mix:
-    curated: 1.0
-    teacher_pool: 0.0
-    on_policy_weighted: 0.0
+  # SFT only: generate fresh teacher completions on the curated prompts and
+  # train on those instead of the dataset's own responses. Use this with
+  # public datasets (UltraFeedback etc.) so training matches YOUR teacher.
+  generate_teacher: false
 
-  # LoRA configuration
   lora:
     rank: 16
     alpha: 32
@@ -83,7 +75,6 @@ training:
       - up_proj
       - down_proj
 
-  # Training hyperparameters
   hyperparams:
     learning_rate: 2.0e-4
     epochs: 3
@@ -92,39 +83,48 @@ training:
     max_seq_length: 2048
     warmup_steps: 5
     weight_decay: 0.01
-    lr_scheduler: linear    # linear | cosine | constant | cosine_with_restarts
+    lr_scheduler: linear      # linear | cosine | constant | cosine_with_restarts
     seed: 42
 
-  quantization: 4bit        # 4bit | 8bit | none
+  quantization: 4bit          # 4bit | 8bit | none
 
-  # Checkpointing: save adapter every N steps, keep last N, always save final
+  # HF-native checkpoints in the keyed adapter dir — interrupted training
+  # resumes automatically on the next run with the same config.
   checkpoint:
-    enabled: true           # Set false to run faster (no disk I/O during training)
-    steps: 10               # Save every N steps
-    keep_last: 2            # Keep only last N checkpoints
-    save_final: true        # Always save final adapter on completion/interruption
+    enabled: true
+    steps: 100
+    keep_last: 2
 
-  # Early stopping: halt training if loss stops improving
+  # Early stopping on eval loss (carves a small eval split off the train set)
   early_stopping:
     enabled: false
-    patience: 50            # Steps without improvement
-    min_delta: 0.001        # Count as "improved" only if loss drops by this much
-    monitor: loss           # Metric to watch
-    mode: min               # "min" for loss, "max" for accuracy
+    patience: 3               # evals without improvement
+    min_delta: 0.001
+    eval_fraction: 0.02
 
-# ── Evaluation / Judge ────────────────────────────────────────────────────────
-judge:
-  mode: heuristic           # heuristic | llm | human
-  llm_model: openrouter/deepseek/deepseek-chat
-  max_examples: 50          # How many holdout pairs to evaluate
-  win_rate_target: 0.60     # Success gate: student wins/ties >60%
+  # Evaluation judge (evaluate stage, preference datasets only)
+  judge:
+    mode: llm                 # heuristic | llm | human
+    llm_model: openrouter/deepseek/deepseek-chat
+    max_examples: 50
+    win_rate_target: 0.60
 
-# ── On-Policy Distillation (ReOPD) ────────────────────────────────────────────
-on_policy:
-  enabled: false
-  teacher_query_interval: 10
-  decay_function: exponential
-  exponential_lambda: 0.9
+# ── ReOPD (training.method: reopd) ────────────────────────────────────────────
+reopd:
+  kappa: 0.9                  # per-turn decay: turn t gets weight kappa^t
+  epochs: 3
+  lr_scale: 0.5               # reopd LR = base LR * lr_scale
+  max_teacher_tokens: 512     # per-turn teacher completion budget
+
+# ── Preference methods (training.method: dpo | orpo | kto) ───────────────────
+preference:
+  beta: 0.1                   # DPO/KTO beta; ORPO odds-ratio weight
+  lr_scale: 1.0               # method LR = base LR * lr_scale
+  epochs: 1
+  max_prompt_length: 1024
+  # DPO on small GPUs: precompute reference log probs in one pass instead of
+  # keeping a second (reference) model resident in VRAM
+  precompute_ref_log_probs: true
 
 # ── Benchmarking ──────────────────────────────────────────────────────────────
 benchmark:
@@ -132,7 +132,6 @@ benchmark:
   tasks:
     - gsm8k
   limit: 50
-  compare_base: true
   device: auto
 
 # ── Deployment ────────────────────────────────────────────────────────────────
@@ -143,7 +142,6 @@ deploy:
   ollama:
     enabled: false
     model_name: localdistill
-    auto_register: true
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
@@ -166,29 +164,40 @@ monitor:
   port: 8080
   refresh_interval: 5
 
-# ── Presets (override settings per run_mode) ──────────────────────────────────
+# ── Presets (selected with --mode; deep-merged over the base config) ─────────
 presets:
   demo:
+    dataset:
+      source: preference
+      huggingface:
+        dataset_id: HuggingFaceH4/ultrafeedback_binarized
+        split: train_prefs
+      holdout_ratio: 0.1
     curation:
-      max_examples: 50
+      max_examples: 10
     training:
       hyperparams:
         epochs: 1
+      checkpoint:
+        enabled: false
     benchmark:
-      limit: 10
-    on_policy:
       enabled: false
 
   full:
+    dataset:
+      source: preference
+      huggingface:
+        dataset_id: HuggingFaceH4/ultrafeedback_binarized
+        split: train_prefs
+      holdout_ratio: 0.1
     curation:
       max_examples: 5000
     training:
+      generate_teacher: true
       hyperparams:
         epochs: 3
     benchmark:
       limit: 100
-    on_policy:
-      enabled: false
 
   preference:
     dataset:
@@ -200,13 +209,29 @@ presets:
     curation:
       max_examples: 5000
     training:
+      generate_teacher: true
       hyperparams:
         epochs: 3
       checkpoint:
         enabled: true
         steps: 10
-        save_final: true
     benchmark:
       enabled: false
-    on_policy:
+
+  # Multi-turn conversations — the right input for reopd (decay needs turns).
+  # Parquet mirror of ShareGPT (RyokoAI/ShareGPT52K raw JSON fails on datasets 4.x).
+  # Sized for a first run: ~200 conversations x ~4 turns of teacher calls.
+  multiturn:
+    dataset:
+      source: huggingface
+      huggingface:
+        dataset_id: Aeala/ShareGPT_Vicuna_unfiltered
+        split: train
+    curation:
+      max_examples: 200
+    training:
+      generate_teacher: true 
+      hyperparams:
+        epochs: 1
+    benchmark:
       enabled: false

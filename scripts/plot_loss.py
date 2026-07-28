@@ -63,7 +63,7 @@ def plot_matplotlib(by_phase: dict, output: Path = None):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True,
                                      gridspec_kw={"height_ratios": [3, 1]})
 
-    colors = {"train": "#2196f3", "on_policy": "#ff9800", "dpo": "#4caf50"}
+    colors = {"sft": "#2196f3", "reopd": "#ff9800", "train": "#2196f3", "on_policy": "#ff9800"}
 
     for phase, data in by_phase.items():
         if not data["steps"]:

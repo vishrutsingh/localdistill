@@ -33,10 +33,12 @@ class LogLevel(Enum):
 
 class PipelineStage(Enum):
     INIT = "init"
+    GENERATE = "generate"
     CURATE = "curate"
+    COLLECT = "collect"
+    WEIGHT = "weight"
     TRAIN = "train"
     EVALUATE = "evaluate"
-    ON_POLICY = "on_policy"
     BENCHMARK = "benchmark"
     DEPLOY = "deploy"
     COMPLETE = "complete"
@@ -97,10 +99,12 @@ LEVEL_COLORS = {
 
 STAGE_ICONS = {
     PipelineStage.INIT: "🔧",
+    PipelineStage.GENERATE: "✨",
     PipelineStage.CURATE: "📋",
+    PipelineStage.COLLECT: "📡",
+    PipelineStage.WEIGHT: "🔀",
     PipelineStage.TRAIN: "🏋️",
     PipelineStage.EVALUATE: "⚖️",
-    PipelineStage.ON_POLICY: "🎓",
     PipelineStage.BENCHMARK: "📊",
     PipelineStage.DEPLOY: "🚀",
     PipelineStage.COMPLETE: "✅",

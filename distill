@@ -182,20 +182,33 @@ cmd_help() {
     stop                Stop monitor
     status              Show recent runs
     logs                Show latest logs
+    adapters            List trained adapters
+    clean [--keep N]    Delete old adapters (default: keep 5)
+
+  METHODS (--method):
+    sft                 curate -> [generate] -> train -> evaluate -> benchmark -> deploy
+    reopd               curate -> collect -> weight -> train -> evaluate -> benchmark -> deploy
+    dpo|orpo|kto        curate -> train -> evaluate -> benchmark -> deploy (preference pairs)
 
   RUN OPTIONS:
-    --mode demo|full    Run mode (demo=50 examples, full=5000)
-    --resume latest     Resume on-policy from latest adapter (skips curate+train)
-    --resume <path>     Resume from specific adapter path
-    --on-policy         Enable on-policy distillation
+    --method sft|reopd|dpo|orpo|kto   Training method (default: config training.method)
+    --mode demo|full|preference|multiturn   Preset (demo=10 examples/1 epoch)
+    --from-adapter latest|PATH    Warm-start training from an adapter
+    --steps a,b         Run a subset of the method's stages
+    --force             Redo all stages (ignore cached artifacts)
     --dry-run           Show plan without executing
 
+  Resume is automatic: artifacts are content-addressed, so rerunning the
+  same command reuses finished stages and resumes interrupted ones.
+
   EXAMPLES:
-    ./distill setup                  # First time setup
-    ./distill run --mode demo        # Quick test (50 examples, ~5 min)
-    ./distill run --mode full        # Full training (5000 examples)
-    ./distill run --resume latest    # Resume on-policy from last adapter
-    ./distill monitor                # Start dashboard
+    ./distill setup                              # First time setup
+    ./distill run --method sft --mode demo       # Quick test
+    ./distill run --method sft --mode preference # SFT on UltraFeedback
+    ./distill run --method reopd --mode multiturn                # ReOPD (multi-turn data)
+    ./distill run --method reopd --mode multiturn --from-adapter latest  # ReOPD after SFT
+    ./distill run --method orpo --mode preference                # Preference method
+    ./distill monitor                            # Start dashboard
 
 EOF
 }
@@ -210,6 +223,7 @@ case "${1:-help}" in
     stop)    shift; cmd_stop "$@" ;;
     status)  shift; cmd_status "$@" ;;
     logs)    shift; cmd_logs "$@" ;;
+    adapters|clean) python3 distill.py "$@" ;;
     help|--help|-h) cmd_help ;;
     *) log_error "Unknown: $1"; cmd_help; exit 1 ;;
 esac

@@ -67,8 +67,8 @@ def export_gguf(
             quantization_method=quantization,
         )
         
-        # Find the generated GGUF file
-        gguf_files = list(gguf_dir.glob("*.gguf"))
+        # Unsloth may write into a nested "<name>_gguf" subdir — search recursively
+        gguf_files = list(gguf_dir.rglob("*.gguf"))
         if not gguf_files:
             _log("Warning: No GGUF file generated")
             return None
@@ -76,8 +76,8 @@ def export_gguf(
         gguf_path = gguf_files[0]
         _log(f"GGUF exported: {gguf_path}")
         
-        # Create Ollama Modelfile
-        modelfile_path = create_modelfile(gguf_dir, gguf_path.name)
+        # Create Ollama Modelfile next to the GGUF (ollama create runs with cwd there)
+        modelfile_path = create_modelfile(gguf_path.parent, gguf_path.name)
         _log(f"Modelfile created: {modelfile_path}")
         
         return str(gguf_path)
@@ -182,13 +182,18 @@ def register_ollama_model(
         return False
 
 
-def list_adapters(adapters_dir: str = "~/localdistill/adapters") -> List[Dict[str, Any]]:
+def _default_adapters_dir() -> Path:
+    """Repo-local adapters directory."""
+    return Path(__file__).resolve().parent.parent / "adapters"
+
+
+def list_adapters(adapters_dir: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     List all trained adapters.
     
     Returns list of adapter info dicts.
     """
-    adapters_dir = Path(adapters_dir).expanduser()
+    adapters_dir = Path(adapters_dir).expanduser() if adapters_dir else _default_adapters_dir()
     if not adapters_dir.exists():
         return []
     
@@ -229,7 +234,7 @@ def list_adapters(adapters_dir: str = "~/localdistill/adapters") -> List[Dict[st
     return adapters
 
 
-def get_latest_adapter(adapters_dir: str = "~/localdistill/adapters") -> Optional[str]:
+def get_latest_adapter(adapters_dir: Optional[str] = None) -> Optional[str]:
     """Get path to the most recent adapter."""
     adapters = list_adapters(adapters_dir)
     if adapters:
@@ -238,7 +243,7 @@ def get_latest_adapter(adapters_dir: str = "~/localdistill/adapters") -> Optiona
 
 
 def cleanup_old_adapters(
-    adapters_dir: str = "~/localdistill/adapters",
+    adapters_dir: Optional[str] = None,
     keep: int = 5,
     logger=None,
 ) -> int:
