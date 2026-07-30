@@ -343,6 +343,53 @@ def simple_judge(
     return winner, f"score_a={score_a:.1f} score_b={score_b:.1f}", ""
 
 
+# ── Statistics ────────────────────────────────────────────────────────────────
+
+def wilson_interval(successes: float, n: int, z: float = 1.96) -> Tuple[float, float]:
+    """Wilson score interval for a proportion.
+
+    Used instead of the normal approximation because it stays sane at the
+    sample sizes an overnight run can afford, and near 0/1.
+    """
+    if n <= 0:
+        return (0.0, 1.0)
+    p = successes / n
+    z2 = z * z
+    denom = 1 + z2 / n
+    centre = p + z2 / (2 * n)
+    margin = z * ((p * (1 - p) / n + z2 / (4 * n * n)) ** 0.5)
+    return (max(0.0, (centre - margin) / denom), min(1.0, (centre + margin) / denom))
+
+
+def _binom_tail_p(k: int, n: int) -> float:
+    """Two-sided exact binomial p-value against p=0.5."""
+    from math import comb
+    if n == 0:
+        return 1.0
+    k = min(k, n - k)
+    tail = sum(comb(n, i) for i in range(k + 1)) / (2 ** n)
+    return min(1.0, 2 * tail)
+
+
+def sign_test(wins_x: int, wins_y: int) -> float:
+    """Two-sided exact sign test on a head-to-head. Ties are uninformative
+    about direction and are excluded, which is what makes this exact."""
+    return _binom_tail_p(min(wins_x, wins_y), wins_x + wins_y)
+
+
+def mcnemar_test(only_x: int, only_y: int) -> float:
+    """Two-sided exact McNemar on discordant pairs.
+
+    For paired outcomes: items where x succeeded and y failed (only_x) versus
+    the reverse (only_y). Items where both agree carry no information about
+    which is better, so excluding them is what buys the extra power over
+    treating the two conditions as independent samples.
+    """
+    return _binom_tail_p(min(only_x, only_y), only_x + only_y)
+
+
+# ── Judging ───────────────────────────────────────────────────────────────────
+
 _VERDICT_RE = re.compile(r"^\W*(?:RESPONSE\s+)?(A|B|TIE)\b", re.IGNORECASE)
 
 
@@ -442,176 +489,198 @@ def judge_pair(
     return Verdict("tie", OK, False, raw)
 
 
-def evaluate_model(
-    model,
-    tokenizer,
-    holdout_path: str,
-    use_llm_judge: bool = False,
-    judge_model: str = "openrouter/openai/gpt-4o-mini",
-    max_examples: int = None,
+@dataclass
+class Comparison:
+    """One head-to-head between two named variants over the same items."""
+    x: str
+    y: str
+    wins_x: int = 0
+    wins_y: int = 0
+    ties: int = 0
+    unparseable: int = 0
+    errors: int = 0
+    inconsistent: int = 0
+    verdicts: List[Verdict] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return self.wins_x + self.wins_y + self.ties
+
+    @property
+    def decisive(self) -> int:
+        return self.wins_x + self.wins_y
+
+    @property
+    def judged_ok(self) -> int:
+        return self.total - self.unparseable - self.errors
+
+    @property
+    def win_rate(self) -> float:
+        """Win rate for x with ties at half credit."""
+        return (self.wins_x + self.ties * 0.5) / self.total if self.total else 0.0
+
+    def summary(self) -> Dict:
+        lo, hi = wilson_interval(self.wins_x + self.ties * 0.5, self.total)
+        return {
+            "x": self.x,
+            "y": self.y,
+            "n": self.total,
+            "wins_x": self.wins_x,
+            "wins_y": self.wins_y,
+            "ties": self.ties,
+            "win_rate": self.win_rate,
+            "ci95": [lo, hi],
+            "win_rate_excl_ties": (self.wins_x / self.decisive) if self.decisive else None,
+            "decisive": self.decisive,
+            "sign_test_p": sign_test(self.wins_x, self.wins_y),
+            "tie_rate": self.ties / self.total if self.total else 0.0,
+            "position_bias_rate": (self.inconsistent / self.judged_ok) if self.judged_ok else 0.0,
+            "unparseable": self.unparseable,
+            "errors": self.errors,
+        }
+
+
+def judge_comparison(
+    prompts: List[str],
+    responses_x: List[str],
+    responses_y: List[str],
+    name_x: str,
+    name_y: str,
+    judge_fn: Callable[[str, str, str], Tuple[Optional[str], str, str]],
+    concurrency: int = 8,
     logger=None,
-    max_new_tokens: int = 1024,
-    max_seq_length: int = 2048,
-    batch_size: int = 8,
-) -> Dict:
-    """Evaluate model on holdout set.
+) -> Comparison:
+    """Judge x against y over aligned items, in parallel, both orders each.
 
-    Args:
-        model: Loaded student model
-        tokenizer: Tokenizer
-        holdout_path: Path to holdout.jsonl
-        use_llm_judge: Whether to use LLM judge (costs money)
-        judge_model: Model to use for judging
-        max_examples: Limit number of examples to evaluate
-        logger: Optional logger
-        max_new_tokens: Generation budget. Must match the budget the reference
-            responses were produced with, or the student is penalised for
-            truncation that is an artefact of the harness.
-        max_seq_length: Total context; inputs are truncated to fit the budget
-        batch_size: Generation batch size (halved automatically on OOM)
-
-    Returns:
-        Dict with evaluation results and statistics
+    Aborts once judge failures pass JUDGE_FAILURE_ABORT_RATE: a judge that is
+    down or unparseable produces a result centred on 50%, which reads exactly
+    like "no effect" and would otherwise be reported as a finding.
     """
-    def log(msg):
-        if logger:
-            logger.info(msg)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    n = len(prompts)
+    comp = Comparison(x=name_x, y=name_y, verdicts=[None] * n)
+    if n == 0:
+        return comp
+
+    def work(i):
+        return i, judge_pair(prompts[i], responses_x[i], responses_y[i], judge_fn)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = [pool.submit(work, i) for i in range(n)]
+        try:
+            for fut in as_completed(futures):
+                i, verdict = fut.result()
+                comp.verdicts[i] = verdict
+                done += 1
+
+                if verdict.status == UNPARSEABLE:
+                    comp.unparseable += 1
+                elif verdict.status == ERROR:
+                    comp.errors += 1
+                elif not verdict.consistent:
+                    comp.inconsistent += 1
+
+                failed = comp.unparseable + comp.errors
+                if (failed >= JUDGE_FAILURE_ABORT_MIN
+                        and failed / done > JUDGE_FAILURE_ABORT_RATE):
+                    raise JudgeUnavailable(
+                        f"Judge failed on {failed}/{done} items judging "
+                        f"{name_x} vs {name_y} ({comp.errors} errors, "
+                        f"{comp.unparseable} unparseable). "
+                        f"Last error: {verdict.error or 'n/a'}"
+                    )
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
+
+    for verdict in comp.verdicts:
+        if verdict.winner == "x":
+            comp.wins_x += 1
+        elif verdict.winner == "y":
+            comp.wins_y += 1
         else:
-            print(f"[eval] {msg}")
+            comp.ties += 1
 
-    pairs = load_holdout(holdout_path)
-    if max_examples:
-        pairs = pairs[:max_examples]
+    if logger:
+        s = comp.summary()
+        logger.info(
+            f"{name_x} vs {name_y}: {s['win_rate']*100:.1f}% "
+            f"[{s['ci95'][0]*100:.1f}, {s['ci95'][1]*100:.1f}] "
+            f"(W{comp.wins_x}/L{comp.wins_y}/T{comp.ties}, p={s['sign_test_p']:.3f})"
+        )
+    return comp
 
-    log(f"Evaluating on {len(pairs)} holdout examples")
 
-    if use_llm_judge:
-        judge_fn = lambda p, a, b: llm_judge(p, a, b, judge_model)
-    else:
-        judge_fn = simple_judge
+def paired_outcomes(comp_x_ref: Comparison, comp_y_ref: Comparison) -> Dict:
+    """McNemar between two variants scored against a shared reference.
 
-    # Phase 1: generate everything in batches
-    log(f"Generating {len(pairs)} responses (batch_size={batch_size}, max_new_tokens={max_new_tokens})...")
-    generations = generate_batch(
-        model, tokenizer, [prompt_messages(p) for p in pairs],
-        max_new_tokens=max_new_tokens, max_seq_length=max_seq_length,
-        batch_size=batch_size, logger=logger,
-    )
-    health = generation_health(generations)
-    log(f"Generation: {health['gen_seconds']:.0f}s, mean {health['mean_tokens']:.0f} tokens, "
-        f"{health['truncation_rate']*100:.1f}% truncated, {health['eos_rate']*100:.1f}% stopped on their own")
-    if health["truncation_rate"] > 0.05:
-        log(f"  WARNING: {health['truncation_rate']*100:.0f}% of responses hit the token cap without "
-            f"finishing — they will be judged as incomplete regardless of quality")
-    if health["degenerate_rate"] > 0.05:
-        log(f"  WARNING: {health['degenerate_rate']*100:.0f}% of responses are repetitive "
-            f"(>30% duplicate 4-grams) — a decode-loop signature typical of an overfit model")
-    if health["eos_rate"] < 0.90:
-        log(f"  WARNING: only {health['eos_rate']*100:.0f}% of responses terminated on their own — "
-            f"check that training examples end with the tokenizer's EOS token")
-
-    # Phase 2: judge
-    results = []
-    wins = {"student": 0, "chosen": 0, "tie": 0}
-    failures = {UNPARSEABLE: 0, ERROR: 0}
-    inconsistent = 0
-
-    for i, (pair, gen) in enumerate(zip(pairs, generations)):
-        prompt = pair["prompt"]
-        chosen_response = reference_response(pair)
-        student_response = gen.text
-
-        # Judge both orders; x=student, y=chosen
-        log(f"[{i+1}/{len(pairs)}] Judging...")
-        verdict = judge_pair(prompt, student_response, chosen_response, judge_fn)
-        winner = {"x": "student", "y": "chosen", "tie": "tie"}[verdict.winner]
-        wins[winner] += 1
-        if verdict.status != OK:
-            failures[verdict.status] += 1
-        elif not verdict.consistent:
-            inconsistent += 1
-
-        results.append(EvalResult(
-            prompt=prompt,
-            student_response=student_response,
-            chosen_response=chosen_response,
-            winner=winner,
-            score_chosen=pair.get("score_chosen"),
-            judge_status=verdict.status,
-            judge_consistent=verdict.consistent,
-            judge_raw=verdict.raw,
-            judge_error=verdict.error,
-            generation=gen,
-        ))
-
-        # Fail fast: a broken judge makes every later GPU-hour worthless
-        n_failed = failures[UNPARSEABLE] + failures[ERROR]
-        if (n_failed >= JUDGE_FAILURE_ABORT_MIN
-                and n_failed / (i + 1) > JUDGE_FAILURE_ABORT_RATE):
-            raise JudgeUnavailable(
-                f"Judge failed on {n_failed}/{i + 1} items "
-                f"({failures[ERROR]} errors, {failures[UNPARSEABLE]} unparseable). "
-                f"Last error: {verdict.error or 'n/a'}"
-            )
-
-        if verdict.status != OK:
-            note = f" [{verdict.status}]"
-        elif not verdict.consistent:
-            note = " [position-biased]"
+    Both comparisons must cover the same items in the same order. Items where
+    the two variants agree carry no information about which is better; only the
+    discordant ones do, and using that is worth roughly 2-3x the sample size.
+    """
+    only_x = only_y = both = neither = 0
+    for vx, vy in zip(comp_x_ref.verdicts, comp_y_ref.verdicts):
+        # "beat the reference" = this variant won outright
+        x_won = vx is not None and vx.winner == "x"
+        y_won = vy is not None and vy.winner == "x"
+        if x_won and not y_won:
+            only_x += 1
+        elif y_won and not x_won:
+            only_y += 1
+        elif x_won and y_won:
+            both += 1
         else:
-            note = ""
-        log(f"  Winner: {winner}{note}")
-
-    # Calculate statistics
-    total = len(results)
-    if total == 0:
-        raise ValueError(f"Holdout {holdout_path} produced no examples to evaluate")
-
-    n_failed = failures[UNPARSEABLE] + failures[ERROR]
-    judged_ok = total - n_failed
-    decisive = wins["student"] + wins["chosen"]
-    student_win_rate = (wins["student"] + wins["tie"] * 0.5) / total
-    # Ties carry no information about direction; reporting both makes a
-    # tie-heavy (i.e. uninformative) judge visible instead of averaging it away.
-    win_rate_excl_ties = wins["student"] / decisive if decisive else None
-    tie_rate = wins["tie"] / total
-    # Only items the judge actually ruled on twice can show order disagreement.
-    position_bias_rate = inconsistent / judged_ok if judged_ok else 0.0
-
-    log(f"\nResults:")
-    log(f"  Student wins: {wins['student']} ({wins['student']/total*100:.1f}%)")
-    log(f"  Chosen wins: {wins['chosen']} ({wins['chosen']/total*100:.1f}%)")
-    log(f"  Ties: {wins['tie']} ({tie_rate*100:.1f}%)")
-    log(f"  Student win rate (ties=0.5): {student_win_rate*100:.1f}%")
-    if win_rate_excl_ties is not None:
-        log(f"  Student win rate (excl. ties): {win_rate_excl_ties*100:.1f}% of {decisive}")
-    log(f"  Position bias (judge flipped): {inconsistent}/{judged_ok} ({position_bias_rate*100:.1f}%)")
-    log(f"  Judge failures: {n_failed} ({failures[ERROR]} errors, {failures[UNPARSEABLE]} unparseable)")
-
-    if tie_rate > 0.40:
-        log(f"  WARNING: tie rate {tie_rate*100:.0f}% — judge is barely discriminating, "
-            f"win rate is pulled toward 50% regardless of model quality")
-    if position_bias_rate > 0.30:
-        log(f"  WARNING: position bias {position_bias_rate*100:.0f}% — judge disagrees "
-            f"with itself on order; treat this comparison as low confidence")
-
+            neither += 1
     return {
-        "total": total,
-        "wins": wins,
-        "student_win_rate": student_win_rate,
-        "win_rate_excl_ties": win_rate_excl_ties,
-        "decisive": decisive,
-        "tie_rate": tie_rate,
-        "position_bias_rate": position_bias_rate,
-        "judge_failures": n_failed,
-        "judge_errors": failures[ERROR],
-        "judge_unparseable": failures[UNPARSEABLE],
-        "judge_mode": "llm" if use_llm_judge else "heuristic",
-        "judge_model": judge_model if use_llm_judge else None,
-        "valid_for_gating": use_llm_judge,
-        "generation": health,
-        "results": results,
+        "only_x": only_x,
+        "only_y": only_y,
+        "both": both,
+        "neither": neither,
+        "discordant": only_x + only_y,
+        "mcnemar_p": mcnemar_test(only_x, only_y),
     }
+
+
+def adapter_fingerprint(model) -> Dict:
+    """Evidence that a LoRA adapter is loaded, attached and actually trained.
+
+    LoRA B matrices initialise to zero, so an all-zero B means the adapter is
+    present but untrained -- and an adapter that never attached means the whole
+    evaluation silently compares the base model against itself and reports no
+    effect. Both are indistinguishable from "the method does not work" unless
+    checked.
+    """
+    n_modules = n_trained = 0
+    n_params = 0
+    total_abs = 0.0
+    for name, param in model.named_parameters():
+        if "lora_" not in name:
+            continue
+        n_params += param.numel()
+        if "lora_B" in name:
+            n_modules += 1
+            magnitude = float(param.detach().abs().sum().item())
+            total_abs += magnitude
+            if magnitude > 0:
+                n_trained += 1
+    return {
+        "lora_modules": n_modules,
+        "lora_modules_trained": n_trained,
+        "lora_params": n_params,
+        "lora_b_abs_sum": total_abs,
+        "attached": n_modules > 0,
+        "trained": n_trained > 0,
+    }
+
+
+def identical_rate(a: List[str], b: List[str]) -> float:
+    """Fraction of items where two variants produced byte-identical output."""
+    if not a:
+        return 0.0
+    return sum(1 for x, y in zip(a, b) if x.strip() == y.strip()) / len(a)
 
 
 def _smoke(model_name: str):
@@ -727,5 +796,56 @@ if __name__ == "__main__":
     h = generation_health(g)
     assert h["truncation_rate"] == 0.5 and h["eos_rate"] == 0.5
     assert h["degenerate_rate"] == 0.5 and h["empty_rate"] == 0.5
+
+    # Statistics. Wilson 60/100 is a textbook value; the binomial cases are
+    # hand-checkable (5 wins 0 losses -> 2 * 1/32).
+    lo, hi = wilson_interval(60, 100)
+    assert (round(lo, 4), round(hi, 4)) == (0.5020, 0.6906), (lo, hi)
+    lo, hi = wilson_interval(50, 100)
+    assert lo < 0.5 < hi, (lo, hi)
+    assert wilson_interval(0, 0) == (0.0, 1.0)
+    assert wilson_interval(10, 10)[1] == 1.0
+
+    assert round(sign_test(60, 40), 4) == 0.0569, sign_test(60, 40)
+    assert round(sign_test(5, 0), 4) == 0.0625, sign_test(5, 0)
+    assert sign_test(50, 50) == 1.0
+    assert sign_test(0, 0) == 1.0
+    assert sign_test(30, 70) == sign_test(70, 30)          # symmetric
+    assert sign_test(90, 10) < sign_test(60, 40)           # stronger -> smaller p
+
+    assert round(mcnemar_test(5, 0), 4) == 0.0625
+    assert mcnemar_test(10, 10) == 1.0
+    assert mcnemar_test(0, 0) == 1.0
+    # Pairing is the point: 20 vs 10 discordant is significant-ish, while the
+    # same counts buried in 400 concordant items would not be if unpaired.
+    assert mcnemar_test(20, 10) < 0.15, mcnemar_test(20, 10)
+
+    # Comparison bookkeeping and the reported summary
+    comp = Comparison("tuned", "base", wins_x=60, wins_y=30, ties=10, inconsistent=5)
+    s = comp.summary()
+    assert s["n"] == 100 and s["decisive"] == 90
+    assert s["win_rate"] == 0.65 and round(s["win_rate_excl_ties"], 4) == 0.6667
+    assert s["ci95"][0] > 0.5, s["ci95"]        # a real effect clears the interval
+    assert round(s["position_bias_rate"], 4) == 0.05
+    flat = Comparison("tuned", "base", wins_x=50, wins_y=50, ties=0).summary()
+    assert flat["ci95"][0] < 0.5 < flat["ci95"][1], flat["ci95"]   # null does not
+
+    # paired_outcomes counts only discordant items
+    def _v(w):
+        return Verdict(w, OK, True, [])
+    a = Comparison("tuned", "reference", verdicts=[_v("x"), _v("x"), _v("y"), _v("tie")])
+    b = Comparison("base", "reference", verdicts=[_v("x"), _v("y"), _v("y"), _v("x")])
+    p = paired_outcomes(a, b)
+    assert p == {"only_x": 1, "only_y": 1, "both": 1, "neither": 1,
+                 "discordant": 2, "mcnemar_p": 1.0}, p
+
+    # gap_closed: base loses badly, tuned draws level -> 100% of the gap
+    from distill import DistillPipeline as _P
+    assert _P._gap_closed(0.10, 0.50) == 1.0
+    assert _P._gap_closed(0.10, 0.10) == 0.0
+    assert _P._gap_closed(0.50, 0.50) is None      # no gap to close
+
+    assert identical_rate(["a", "b"], ["a", "c"]) == 0.5
+    assert identical_rate([], []) == 0.0
 
     print("lib/evaluate.py self-check passed")

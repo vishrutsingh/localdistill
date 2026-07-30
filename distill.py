@@ -33,6 +33,7 @@ import uuid
 import argparse
 import json
 import shutil
+from dataclasses import asdict
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -80,7 +81,12 @@ from lib.deploy import (
     export_gguf, register_ollama_model, list_adapters,
     check_ollama_installed, cleanup_old_adapters,
 )
-from lib.methods import compute_artifacts, latest_adapter, ADAPTERS_DIR
+from lib.methods import compute_artifacts, compute_eval_artifacts, latest_adapter, ADAPTERS_DIR
+from lib.evaluate import (
+    Generation, adapter_fingerprint, generate_batch, generation_health, identical_rate,
+    judge_comparison, llm_judge, load_holdout, paired_outcomes, prompt_messages,
+    reference_response, simple_judge,
+)
 
 
 # ── Trainer helpers ───────────────────────────────────────────────────────────
@@ -893,6 +899,132 @@ class DistillPipeline:
 
     # ── Evaluate ──────────────────────────────────────────────────────────────
 
+    def _load_for_inference(self, model_ref: str, max_seq_length: int):
+        """Load a model (base name or adapter dir) for greedy evaluation."""
+        from unsloth import FastLanguageModel
+        load_in_4bit = (self.config.training.quantization == "4bit")
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_ref, max_seq_length=max_seq_length, dtype=None,
+                load_in_4bit=load_in_4bit,
+            )
+        except ValueError as e:
+            if "dispatched on the CPU or the disk" not in str(e):
+                raise
+            self.logger.warning("OOM loading eval model, retrying with max_seq_length=512...")
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_ref, max_seq_length=512, dtype=None,
+                load_in_4bit=load_in_4bit,
+            )
+        FastLanguageModel.for_inference(model)
+        return model, tokenizer
+
+    def _free_gpu(self):
+        """Release VRAM. The caller must `del` its own references first — a
+        reference passed into here would still be held by the caller's frame,
+        so the cache would not actually drop and loading the next variant OOMs
+        on the small cards this targets."""
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _cached_generations(self, cache: Path, n_expected: int, label: str):
+        """Load cached generations if they cover this holdout, else None."""
+        if self.force or not cache.exists():
+            return None
+        rows = [json.loads(l) for l in open(cache)]
+        if len(rows) != n_expected:
+            self.logger.info(f"{label}: cache has {len(rows)} rows, need {n_expected} — regenerating")
+            return None
+        self.logger.info(f"{label}: reusing cached generations ({cache})")
+        return [Generation(**r) for r in rows]
+
+    def _save_generations(self, cache: Path, gens):
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache, "w") as f:
+            for g in gens:
+                f.write(json.dumps(asdict(g), ensure_ascii=False) + "\n")
+
+    def _generate_variant(self, label: str, model_ref: str, prefixes, cache: Path,
+                          max_seq_length: int, fingerprint: bool = False):
+        """Generate (or reuse) one variant's responses. Returns (gens, fingerprint)."""
+        cached = self._cached_generations(cache, len(prefixes), label)
+        if cached is not None and not fingerprint:
+            return cached, None
+
+        model, tokenizer = self._load_for_inference(model_ref, max_seq_length)
+        fp = adapter_fingerprint(model) if fingerprint else None
+        if fp is not None:
+            self.logger.info(
+                f"Adapter: {fp['lora_modules']} LoRA modules, {fp['lora_params']:,} params, "
+                f"{fp['lora_modules_trained']} trained (|B| sum {fp['lora_b_abs_sum']:.3g})"
+            )
+            if not fp["attached"]:
+                raise RuntimeError(
+                    f"No LoRA modules found on the model loaded from {model_ref} — the "
+                    f"adapter did not attach, so this would evaluate the base model and "
+                    f"report no effect."
+                )
+            if not fp["trained"]:
+                raise RuntimeError(
+                    f"Every LoRA B matrix in {model_ref} is zero — the adapter is present "
+                    f"but untrained, so it is mathematically identical to the base model."
+                )
+
+        if cached is not None:
+            del model, tokenizer
+            self._free_gpu()
+            return cached, fp
+
+        self.logger.info(f"{label}: generating {len(prefixes)} responses...")
+        gens = generate_batch(
+            model, tokenizer, prefixes,
+            max_new_tokens=self.config.models.teacher_max_tokens,
+            max_seq_length=max_seq_length,
+            batch_size=self.config.training.judge.batch_size,
+            logger=self.logger,
+        )
+        self._save_generations(cache, gens)
+        health = generation_health(gens)
+        self.logger.info(
+            f"{label}: {health['gen_seconds']:.0f}s, mean {health['mean_tokens']:.0f} tokens, "
+            f"{health['truncation_rate']*100:.0f}% truncated, {health['eos_rate']*100:.0f}% stopped on their own"
+        )
+        del model, tokenizer
+        self._free_gpu()
+        return gens, fp
+
+    def _teacher_holdout_responses(self, pairs, cache: Path):
+        """Teacher responses on the holdout prompts, for the gap-closed metric."""
+        if not self.force and cache.exists():
+            rows = [json.loads(l) for l in open(cache)]
+            if len(rows) == len(pairs):
+                self.logger.info(f"teacher: reusing cached holdout responses ({cache})")
+                return [r["text"] for r in rows]
+
+        from concurrent.futures import ThreadPoolExecutor
+        self.logger.info(f"teacher: generating {len(pairs)} holdout responses...")
+        prefixes = [prompt_messages(p) for p in pairs]
+
+        def one(msgs):
+            return self._teacher_complete(msgs, self.config.models.teacher_max_tokens) or ""
+
+        with ThreadPoolExecutor(max_workers=self.config.models.teacher_concurrency) as pool:
+            texts = list(pool.map(one, prefixes))
+
+        missing = sum(1 for t in texts if not t)
+        if missing:
+            self.logger.warning(f"teacher: {missing}/{len(texts)} holdout responses failed")
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache, "w") as f:
+            for t in texts:
+                f.write(json.dumps({"text": t}, ensure_ascii=False) + "\n")
+        return texts
+
+    # ── Evaluate ──────────────────────────────────────────────────────────────
+
     def _stage_evaluate(self):
         self.logger.set_stage(Stage.EVALUATE)
         holdout = self.paths["holdout"]
@@ -904,32 +1036,22 @@ class DistillPipeline:
             self.logger.warning(f"No adapter at {adapter}, skipping evaluation")
             return
 
-        self.logger.info(f"Evaluating: {adapter}")
-        import torch
-        from unsloth import FastLanguageModel
-        from lib.evaluate import evaluate_model
-
-        max_seq_length = self.config.training.hyperparams.max_seq_length
-        try:
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=adapter, max_seq_length=max_seq_length, dtype=None,
-                load_in_4bit=(self.config.training.quantization == "4bit"),
-            )
-        except ValueError as e:
-            if "dispatched on the CPU or the disk" in str(e):
-                self.logger.warning("OOM loading eval model, retrying with max_seq_length=512...")
-                max_seq_length = 512
-                model, tokenizer = FastLanguageModel.from_pretrained(
-                    model_name=adapter, max_seq_length=max_seq_length, dtype=None,
-                    load_in_4bit=(self.config.training.quantization == "4bit"),
-                )
-            else:
-                raise
-        FastLanguageModel.for_inference(model)
-
         judge = self.config.training.judge
         use_llm = judge.mode == "llm"
-        self.logger.info(f"Judge: {'LLM (' + judge.llm_model + ')' if use_llm else 'heuristic'}, target: {judge.win_rate_target*100:.0f}%")
+        max_seq_length = self.config.training.hyperparams.max_seq_length
+
+        pairs = load_holdout(str(holdout))
+        if judge.max_examples:
+            pairs = pairs[:judge.max_examples]
+        if not pairs:
+            raise ValueError(f"Holdout {holdout} produced no examples to evaluate")
+
+        prompts = [p.get("prompt", "") for p in pairs]
+        prefixes = [prompt_messages(p) for p in pairs]
+        references = [reference_response(p) for p in pairs]
+
+        self.logger.info(f"Judge: {'LLM (' + judge.llm_model + ')' if use_llm else 'heuristic'}, "
+                         f"n={len(pairs)}, target: {judge.win_rate_target*100:.0f}%")
 
         # Self-preference: an LLM judge favours its own family's outputs, so a
         # judge that is also the teacher inflates the win rate in proportion to
@@ -943,77 +1065,196 @@ class DistillPipeline:
                 f"graded by it. Win rate is inflated; use a different judge family."
             )
 
-        eval_results = evaluate_model(
-            model=model, tokenizer=tokenizer,
-            holdout_path=str(holdout),
-            use_llm_judge=use_llm,
-            judge_model=judge.llm_model,
-            max_examples=judge.max_examples,
-            logger=self.logger,
-            max_new_tokens=self.config.models.teacher_max_tokens,
-            max_seq_length=max_seq_length,
-        )
+        # ── Generate every variant on the same items ─────────────────────────
+        cache = compute_eval_artifacts(self.config, holdout, len(pairs), Path(adapter))
+        tuned_gens, fp = self._generate_variant(
+            "tuned", adapter, prefixes, cache["tuned"], max_seq_length, fingerprint=True)
+        base_gens, _ = self._generate_variant(
+            "base", self.config.models.student, prefixes, cache["base"], max_seq_length)
 
-        # Per-example record. Without this, aggregate counts are the only
-        # surviving evidence: you cannot see what the model actually said, and
-        # re-judging (different judge, fixed parser) means regenerating
-        # everything on the GPU instead of replaying a file.
-        predictions = self.logger.run_dir / "eval_predictions.jsonl"
-        with open(predictions, "w") as f:
-            for i, r in enumerate(eval_results["results"]):
-                f.write(json.dumps({
+        tuned = [g.text for g in tuned_gens]
+        base = [g.text for g in base_gens]
+        variants = {"tuned": tuned, "base": base, "reference": references}
+
+        teacher = None
+        if judge.compare_teacher:
+            teacher = self._teacher_holdout_responses(pairs, cache["teacher"])
+            variants["teacher"] = teacher
+
+        # Behavioural check: an adapter that attached but changed nothing gives
+        # a Δ of 0 that looks exactly like "the method does not work".
+        same_rate = identical_rate(base, tuned)
+        self.metrics["eval_base_tuned_identical_rate"] = same_rate
+        if same_rate > 0.90:
+            self.logger.error(
+                f"SUSPECT: base and tuned produced identical output on "
+                f"{same_rate*100:.0f}% of items — training may have had no effect, or "
+                f"the adapter is not being applied at eval time. Treat any Δ below as unproven."
+            )
+
+        # ── Judge ────────────────────────────────────────────────────────────
+        judge_fn = (lambda p, a, b: llm_judge(p, a, b, judge.llm_model)) if use_llm else simple_judge
+        comparisons = [("tuned", "base"), ("tuned", "reference"), ("base", "reference")]
+        if teacher is not None:
+            comparisons += [("tuned", "teacher"), ("base", "teacher")]
+
+        results = {}
+        for x, y in comparisons:
+            results[f"{x}_vs_{y}"] = judge_comparison(
+                prompts, variants[x], variants[y], x, y, judge_fn,
+                concurrency=judge.concurrency, logger=self.logger,
+            )
+
+        headline = results["tuned_vs_base"]
+        paired = paired_outcomes(results["tuned_vs_reference"], results["base_vs_reference"])
+
+        # ── Record ───────────────────────────────────────────────────────────
+        summaries = {k: c.summary() for k, c in results.items()}
+        gen_health = {"tuned": generation_health(tuned_gens), "base": generation_health(base_gens)}
+
+        report = {
+            "n": len(pairs),
+            "judge_mode": judge.mode,
+            "judge_model": judge.llm_model if use_llm else None,
+            "judge_is_teacher": judge_is_teacher,
+            "valid_for_gating": use_llm,
+            "comparisons": summaries,
+            "paired_vs_reference": paired,
+            "adapter": fp,
+            "base_tuned_identical_rate": same_rate,
+            "generation": gen_health,
+        }
+        if teacher is not None:
+            report["gap_closed"] = self._gap_closed(
+                summaries["base_vs_teacher"]["win_rate"], summaries["tuned_vs_teacher"]["win_rate"])
+
+        report_path = self.logger.run_dir / "eval_report.json"
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+        self.metrics["eval_report_path"] = str(report_path)
+
+        self._write_eval_predictions(pairs, variants, tuned_gens, base_gens, results)
+
+        # Headline metrics
+        h = summaries["tuned_vs_base"]
+        self.metrics["eval_delta_vs_base"] = h["win_rate"] - 0.5
+        self.metrics["eval_tuned_vs_base_win_rate"] = h["win_rate"]
+        self.metrics["eval_tuned_vs_base_ci95"] = h["ci95"]
+        self.metrics["eval_tuned_vs_base_p"] = h["sign_test_p"]
+        self.metrics["eval_mcnemar_p"] = paired["mcnemar_p"]
+        self.metrics["eval_student_win_rate"] = summaries["tuned_vs_reference"]["win_rate"]
+        self.metrics["eval_total"] = len(pairs)
+        for key, comp in summaries.items():
+            self.metrics[f"eval_{key}_win_rate"] = comp["win_rate"]
+
+        self._log_eval_verdict(summaries, paired, report, judge)
+
+    @staticmethod
+    def _gap_closed(base_vs_teacher: float, tuned_vs_teacher: float):
+        """Fraction of the student -> teacher gap the run closed.
+
+        1.0 means the tuned student now ties the teacher; 0.0 means no movement.
+        Undefined when the base already matches the teacher (no gap to close).
+        """
+        gap = 0.5 - base_vs_teacher
+        if gap <= 0.01:
+            return None
+        return (tuned_vs_teacher - base_vs_teacher) / gap
+
+    def _write_eval_predictions(self, pairs, variants, tuned_gens, base_gens, results):
+        """Per-example record. Without it, aggregate counts are the only
+        surviving evidence: you cannot see what the models actually said, and
+        re-judging (different judge, fixed parser) means regenerating on the GPU
+        instead of replaying a file."""
+        path = self.logger.run_dir / "eval_predictions.jsonl"
+        with open(path, "w") as f:
+            for i, pair in enumerate(pairs):
+                row = {
                     "idx": i,
-                    "prompt": r.prompt,
-                    "student_response": r.student_response,
-                    "reference_response": r.chosen_response,
-                    "winner": r.winner,
-                    "judge_status": r.judge_status,
-                    "judge_consistent": r.judge_consistent,
-                    "judge_raw": r.judge_raw,
-                    "judge_error": r.judge_error,
-                    "score_chosen": r.score_chosen,
-                    **({} if r.generation is None else {
-                        "student_tokens": r.generation.n_tokens,
-                        "student_truncated": r.generation.truncated,
-                        "student_eos": r.generation.eos,
-                        "student_repetition_ratio": round(r.generation.repetition_ratio, 4),
-                        "input_truncated": r.generation.input_truncated,
-                        "gen_seconds": round(r.generation.seconds, 3),
-                    }),
-                }, ensure_ascii=False) + "\n")
-        self.logger.info(f"Per-example predictions: {predictions}")
-        self.metrics["eval_predictions_path"] = str(predictions)
+                    "prompt": pair.get("prompt", ""),
+                    "tuned_response": variants["tuned"][i],
+                    "base_response": variants["base"][i],
+                    "reference_response": variants["reference"][i],
+                    "score_chosen": pair.get("score_chosen"),
+                    "tuned_tokens": tuned_gens[i].n_tokens,
+                    "tuned_truncated": tuned_gens[i].truncated,
+                    "tuned_eos": tuned_gens[i].eos,
+                    "tuned_repetition_ratio": round(tuned_gens[i].repetition_ratio, 4),
+                    "base_tokens": base_gens[i].n_tokens,
+                    "base_repetition_ratio": round(base_gens[i].repetition_ratio, 4),
+                    "input_truncated": tuned_gens[i].input_truncated,
+                }
+                if "teacher" in variants:
+                    row["teacher_response"] = variants["teacher"][i]
+                for name, comp in results.items():
+                    v = comp.verdicts[i]
+                    row[name] = {
+                        "winner": v.winner, "status": v.status,
+                        "consistent": v.consistent, "raw": v.raw, "error": v.error,
+                    }
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self.logger.info(f"Per-example predictions: {path}")
+        self.metrics["eval_predictions_path"] = str(path)
 
-        self.metrics["eval_total"] = eval_results["total"]
-        self.metrics["eval_student_wins"] = eval_results["wins"]["student"]
-        self.metrics["eval_chosen_wins"] = eval_results["wins"]["chosen"]
-        self.metrics["eval_ties"] = eval_results["wins"]["tie"]
-        self.metrics["eval_student_win_rate"] = eval_results["student_win_rate"]
-        for key in ("win_rate_excl_ties", "tie_rate", "position_bias_rate",
-                    "judge_failures", "judge_errors", "judge_unparseable", "judge_mode"):
-            self.metrics[f"eval_{key}"] = eval_results[key]
-        for key, value in eval_results["generation"].items():
-            self.metrics[f"eval_gen_{key}"] = value
+    def _log_eval_verdict(self, summaries, paired, report, judge):
+        """The one thing that has to be unambiguous at 7am."""
+        h = summaries["tuned_vs_base"]
+        lo, hi = h["ci95"]
+        delta_pp = (h["win_rate"] - 0.5) * 100
 
-        win_pct = eval_results["student_win_rate"] * 100
-        if not eval_results["valid_for_gating"]:
-            # The heuristic judge scores formatting, not quality — it cannot
-            # clear a gate, and saying so is the whole point of having one.
+        if not report["valid_for_gating"]:
+            verdict = "NOT MEASURED"
+        elif lo > 0.5:
+            verdict = "IMPROVED"
+        elif hi < 0.5:
+            verdict = "REGRESSED"
+        else:
+            verdict = "NO DETECTED EFFECT"
+        self.metrics["eval_verdict"] = verdict
+
+        self.logger.info("─" * 60)
+        self.logger.info(
+            f"VERDICT: {verdict}  (tuned vs base {h['win_rate']*100:.1f}%, "
+            f"Δ {delta_pp:+.1f}pp, 95% CI [{lo*100:.1f}, {hi*100:.1f}], "
+            f"sign p={h['sign_test_p']:.3f}, McNemar p={paired['mcnemar_p']:.3f})"
+        )
+        for name, s in summaries.items():
+            self.logger.info(
+                f"  {name:24s} {s['win_rate']*100:5.1f}%  "
+                f"[{s['ci95'][0]*100:.1f}, {s['ci95'][1]*100:.1f}]  "
+                f"W{s['wins_x']}/L{s['wins_y']}/T{s['ties']}"
+            )
+        if report.get("gap_closed") is not None:
+            self.logger.info(f"  gap to teacher closed: {report['gap_closed']*100:.0f}%")
+
+        if verdict == "NO DETECTED EFFECT":
             self.logger.warning(
-                f"Win rate {win_pct:.1f}% — GATE NOT EVALUATED: judge mode is "
-                f"'{eval_results['judge_mode']}', which is a smoke test, not a "
+                f"The interval spans 50%, so this run cannot distinguish the tuned model "
+                f"from the base model. With n={report['n']} the smallest reliably "
+                f"detectable effect is about ±{(hi-lo)/2*100:.0f}pp — raise "
+                f"training.judge.max_examples to resolve smaller ones."
+            )
+
+        # Legacy gate, now reported next to the baseline it was always missing
+        legacy = summaries["tuned_vs_reference"]["win_rate"]
+        base_legacy = summaries["base_vs_reference"]["win_rate"]
+        if not report["valid_for_gating"]:
+            self.logger.warning(
+                f"Win rate vs reference {legacy*100:.1f}% (base {base_legacy*100:.1f}%) — "
+                f"GATE NOT EVALUATED: judge mode is '{judge.mode}', a smoke test, not a "
                 f"quality measure. Set training.judge.mode=llm to gate."
             )
-        elif eval_results["student_win_rate"] >= judge.win_rate_target:
-            self.logger.success(f"GATE CLEARED: {win_pct:.1f}% ≥ {judge.win_rate_target*100:.0f}%")
+        elif legacy >= judge.win_rate_target:
+            self.logger.success(
+                f"GATE CLEARED: {legacy*100:.1f}% ≥ {judge.win_rate_target*100:.0f}% "
+                f"vs reference (base scores {base_legacy*100:.1f}% on the same items)"
+            )
         else:
-            self.logger.warning(f"Gate not cleared: {win_pct:.1f}% < {judge.win_rate_target*100:.0f}%")
-
-        del model
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            self.logger.warning(
+                f"Gate not cleared: {legacy*100:.1f}% < {judge.win_rate_target*100:.0f}% "
+                f"vs reference (base scores {base_legacy*100:.1f}% on the same items)"
+            )
+        self.logger.info("─" * 60)
 
     # ── Benchmark ─────────────────────────────────────────────────────────────
 

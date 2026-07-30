@@ -37,6 +37,9 @@ data/curated_*/
 # Trained adapters (generated outputs)
 adapters/
 
+# Cached evaluation generations (content-addressed, regenerable)
+evals/
+
 # Database
 data/localdistill.db
 localdistill.db

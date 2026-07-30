@@ -97,8 +97,11 @@ class JudgeConfig:
     mode: str = "heuristic"   # heuristic | llm | human
     # Keep in a different family from models.teacher — see config.yaml
     llm_model: str = "openrouter/openai/gpt-4o-mini"
-    max_examples: int = 50
+    max_examples: int = 200
     win_rate_target: float = 0.6
+    batch_size: int = 8            # generation batch size (halves on OOM)
+    concurrency: int = 8           # parallel judge calls
+    compare_teacher: bool = True   # also measure how much of the gap was closed
 
 
 @dataclass

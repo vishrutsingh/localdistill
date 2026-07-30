@@ -30,11 +30,56 @@ from lib.config import Config, to_dict, PREFERENCE_METHODS
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 ADAPTERS_DIR = ROOT / "adapters"
+EVALS_DIR = ROOT / "evals"
 
 
 def _key(obj) -> str:
     blob = json.dumps(obj, sort_keys=True, default=str).encode()
     return hashlib.sha1(blob).hexdigest()[:10]
+
+
+def _file_key(path: Path) -> str:
+    """Content hash of a file — so a regenerated holdout invalidates the cache."""
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:10]
+
+
+def compute_eval_artifacts(config, holdout: Path, n_examples: int,
+                           adapter_dir: Optional[Path] = None) -> Dict[str, Path]:
+    """Paths for cached evaluation generations, content-addressed like the rest.
+
+    The baseline is the expensive part of an honest comparison — the same base
+    student is regenerated for every method you compare. Keying it on
+    (student, holdout content, decode settings) means it is produced once and
+    then reused across every run that shares those, so adding a baseline costs
+    one generation pass ever rather than one per experiment.
+
+    Layout:
+      evals/base_<key>/generations.jsonl      base student, no adapter
+      evals/tuned_<key>/generations.jsonl     adapter under test
+      evals/teacher_<key>/generations.jsonl   teacher completions on the holdout
+    """
+    holdout_key = _file_key(holdout)
+    decode = {
+        "holdout": holdout_key,
+        "n": n_examples,
+        "max_new_tokens": config.models.teacher_max_tokens,
+        "max_seq_length": config.training.hyperparams.max_seq_length,
+    }
+    base_key = _key({**decode, "model": config.models.student,
+                     "quantization": config.training.quantization})
+    teacher_key = _key({**decode, "model": config.models.teacher})
+    tuned_key = _key({**decode, "adapter": Path(adapter_dir).name if adapter_dir else "",
+                      "quantization": config.training.quantization})
+
+    return {
+        "base": EVALS_DIR / f"base_{base_key}" / "generations.jsonl",
+        "tuned": EVALS_DIR / f"tuned_{tuned_key}" / "generations.jsonl",
+        "teacher": EVALS_DIR / f"teacher_{teacher_key}" / "generations.jsonl",
+    }
 
 
 def compute_artifacts(config: Config, method: str, from_adapter: Optional[str] = None) -> Dict[str, Path]:

@@ -114,8 +114,18 @@ training:
   judge:
     mode: llm                 # heuristic (smoke test only, cannot gate) | llm | human
     llm_model: openrouter/openai/gpt-4o-mini
-    max_examples: 50
+    # 200, not 50. At n=50 the 95% interval on a win rate is about +/-14 points,
+    # so the 60% gate cannot tell 60% from 50% and the run cannot resolve any
+    # effect short of an enormous one. 200 gives roughly +/-7. Lower it for a
+    # quick look; the report always prints the interval so the cost is visible.
+    max_examples: 200
     win_rate_target: 0.60
+    batch_size: 8             # eval generation batch size (halves on OOM)
+    concurrency: 8            # parallel judge API calls
+    # Also generate teacher responses on the holdout and report how much of the
+    # student -> teacher gap the run closed. Costs one extra pass of teacher API
+    # calls (cached in evals/, so paid once per holdout+teacher).
+    compare_teacher: true
 
 # ── ReOPD (training.method: reopd) ────────────────────────────────────────────
 reopd:
