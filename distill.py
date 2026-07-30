@@ -1181,6 +1181,15 @@ class DistillPipeline:
         missing = sum(1 for t in texts if not t)
         if missing:
             self.logger.warning(f"teacher: {missing}/{len(texts)} holdout responses failed")
+        if missing > 0.1 * len(texts):
+            # Empty responses lose every comparison, so gap_closed built on them
+            # would understate the gap and overstate how much of it was closed.
+            self.logger.error(
+                f"teacher: {missing}/{len(texts)} holdout responses failed (>10%) — "
+                f"dropping the teacher comparison rather than reporting a gap "
+                f"computed against blank responses"
+            )
+            return None
         cache.parent.mkdir(parents=True, exist_ok=True)
         with open(cache, "w") as f:
             for t in texts:
@@ -1253,9 +1262,18 @@ class DistillPipeline:
         # targets next to low similarity on held-out targets is memorisation
         # stated directly, rather than inferred from a loss curve.
         if judge.regurgitation_examples and "regurgitation" in cache:
+            # Compare like with like. When training targets are teacher
+            # completions, held-out similarity must also be measured against
+            # teacher text — scoring against UltraFeedback `chosen` would make
+            # any teacher-trained model look like it memorised, because its
+            # style matches the teacher everywhere, not just on trained items.
+            if self.config.training.generate_teacher and teacher is not None:
+                probe_refs, probe_kind = teacher, "teacher"
+            else:
+                probe_refs, probe_kind = references, "reference"
             self.metrics["eval_regurgitation"] = self._regurgitation_probe(
                 adapter, cache["regurgitation"], max_seq_length,
-                judge.regurgitation_examples, tuned, references)
+                judge.regurgitation_examples, tuned, probe_refs, probe_kind)
 
         # Behavioural check: an adapter that attached but changed nothing gives
         # a Δ of 0 that looks exactly like "the method does not work".
@@ -1281,7 +1299,6 @@ class DistillPipeline:
                 concurrency=judge.concurrency, logger=self.logger,
             )
 
-        headline = results["tuned_vs_base"]
         paired = paired_outcomes(results["tuned_vs_reference"], results["base_vs_reference"])
 
         # ── Record ───────────────────────────────────────────────────────────
@@ -1313,7 +1330,7 @@ class DistillPipeline:
         self.metrics["eval_report_path"] = str(report_path)
 
         self._write_eval_predictions(pairs, variants, tuned_gens, base_gens, results)
-        md = self._write_eval_report_md(report, judge)
+        md = self._write_eval_report_md(report)
         self.logger.info(f"Evaluation report: {md}")
         self.metrics["eval_report_md"] = str(md)
 
@@ -1332,7 +1349,7 @@ class DistillPipeline:
         self._log_eval_verdict(summaries, paired, report, judge)
 
     def _regurgitation_probe(self, adapter, cache: Path, max_seq_length, k,
-                             holdout_responses, holdout_references):
+                             holdout_responses, holdout_references, reference_kind="reference"):
         """Compare the model's output to its own training targets.
 
         train_f1 ~ holdout_f1  -> learned the distribution
@@ -1365,7 +1382,8 @@ class DistillPipeline:
                       / len(holdout_references)) if holdout_references else 0.0
         result = {"train_f1": train_f1, "holdout_f1": holdout_f1,
                   "ratio": (train_f1 / holdout_f1) if holdout_f1 else None,
-                  "n_train": len(targets), "n_holdout": len(holdout_references)}
+                  "n_train": len(targets), "n_holdout": len(holdout_references),
+                  "holdout_reference": reference_kind}
 
         self.logger.info(
             f"Regurgitation: train F1 {train_f1:.3f} (n={len(targets)}) vs "
@@ -1426,7 +1444,7 @@ class DistillPipeline:
         self.logger.info(f"Per-example predictions: {path}")
         self.metrics["eval_predictions_path"] = str(path)
 
-    def _write_eval_report_md(self, report: Dict[str, Any], judge) -> Path:
+    def _write_eval_report_md(self, report: Dict[str, Any]) -> Path:
         """The 7am report: verdict first, then the evidence that qualifies it."""
         def pct(v):
             return "n/a" if v is None else f"{v*100:.1f}%"
