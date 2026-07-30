@@ -105,10 +105,42 @@ Presets (`--mode`): `demo` (10 examples, smoke test), `preference`
   and ETA; interrupted collections resume from `.partial` files.
 - **Training resumes too.** HF checkpoints land in the keyed adapter dir;
   an interrupted run resumes automatically on rerun.
-- **Every run ends with a report.** `logs/runs/<id>/training_summary.json`:
-  loss, steps, eval win rate, adapter path. The `evaluate` gate (preference
-  datasets): student must win/tie >60% of holdout vs chosen, judged by the
-  teacher LLM.
+- **Every run ends with a verdict, not a number.** `evaluate` generates from
+  the tuned adapter, the *base* student, and the teacher on the same holdout
+  items, then judges them head to head. The headline is **tuned vs base** —
+  win rate against the untrained model, with a 95% interval and a paired
+  significance test. A run is only `IMPROVED` when the interval clears 50%;
+  otherwise it says `NO DETECTED EFFECT` and tells you what sample size would
+  resolve it. Read `logs/runs/<id>/eval_report.md`.
+
+## Reading a run
+
+`logs/runs/<id>/` after a run:
+
+| File | What it answers |
+|------|-----------------|
+| `eval_report.md` | Did this work? Verdict, all comparisons, validity checks, overfitting |
+| `eval_report.json` | Same, machine-readable |
+| `eval_predictions.jsonl` | What did the models actually say, per item, plus raw judge replies |
+| `metrics.jsonl` | Every trainer log row at full resolution (loss, eval loss, grad norm, DPO rewards) |
+| `provenance.json` | Git SHA, package versions, GPU, seeds — what produced this |
+| `training_summary.json` | Per-stage outcomes, effective config, headline metrics |
+
+Three things the report will tell you that a win rate alone cannot:
+
+- **Was there a baseline effect at all?** A 62% win rate against reference
+  answers means nothing if the base model already scores 60%. Both are always
+  reported side by side.
+- **Did it memorise?** Held-out loss is always computed against a
+  training-data subset, so the generalization gap, loss divergence, and
+  epoch-boundary drops are tracked. A regurgitation probe measures how closely
+  the model reproduces its own training targets versus held-out ones.
+- **Is the measurement trustworthy?** Every pair is judged in both orders
+  (position bias is measured, not assumed away), judge failures abort rather
+  than becoming ties, and the run fails loudly if the adapter did not attach.
+
+Exit codes: `0` all stages ran, `1` the run failed, `2` finished but a stage
+was skipped — a skipped evaluation is the absence of a measurement, not a pass.
 
 ## Requirements
 
@@ -120,10 +152,14 @@ Presets (`--mode`): `demo` (10 examples, smoke test), `preference`
 
 | Problem | Fix |
 |---------|-----|
-| CUDA OOM | `--student unsloth/Llama-3.2-1B-Instruct`, or lower `max_seq_length`; use the env var above |
-| Teacher rate limits | lower `models.teacher_concurrency` in `config.yaml` |
+| CUDA OOM | `--student unsloth/Llama-3.2-1B-Instruct`, or lower `max_seq_length`; use the env var above. Eval halves its generation batch automatically |
+| Teacher rate limits | lower `models.teacher_concurrency` in `config.yaml`; judge calls use `training.judge.concurrency` |
 | Stale/wrong cache | artifacts are hashed — only `--force` regenerates; nothing goes stale silently |
 | Where's my run? | `./distill status`, `./distill logs`, `logs/runs/<id>/` |
+| `NO DETECTED EFFECT` | The interval spans 50%: this run genuinely cannot tell tuned from base. Raise `training.judge.max_examples`, or accept that the effect is smaller than the harness can resolve |
+| Eval is slow | It generates from base *and* tuned. Base generations are cached in `evals/` and reused by every later run on the same holdout, so only the first one pays |
+| `GATE NOT EVALUATED` | `training.judge.mode` is `heuristic`, which scores formatting, not quality. Set it to `llm` |
+| Evaluation was skipped | Exit code 2. See the stage summary at the end of the run — it names the reason |
 
 ---
 
