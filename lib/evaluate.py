@@ -866,6 +866,19 @@ if __name__ == "__main__":
     assert _P._gap_closed(0.10, 0.10) == 0.0
     assert _P._gap_closed(0.50, 0.50) is None      # no gap to close
 
+    # The verdict comes from the interval, not the point estimate.
+    def _verdict(wx, wy, valid=True):
+        return _P._eval_verdict(Comparison("t", "b", wins_x=wx, wins_y=wy).summary(), valid)
+    assert _verdict(130, 55) == "IMPROVED"
+    assert _verdict(55, 130) == "REGRESSED"
+    assert _verdict(100, 95) == "NO DETECTED EFFECT"
+    # 12-8 is a 60% point estimate on 20 items and must NOT read as a win —
+    # this is the n=50 gate problem the old harness shipped with.
+    assert _verdict(12, 8) == "NO DETECTED EFFECT"
+    assert _verdict(30, 20) == "NO DETECTED EFFECT"     # 60% at n=50: still noise
+    assert _verdict(120, 80) == "IMPROVED"              # 60% at n=200: resolvable
+    assert _verdict(130, 55, valid=False) == "NOT MEASURED"
+
     assert identical_rate(["a", "b"], ["a", "c"]) == 0.5
     assert identical_rate([], []) == 0.0
 

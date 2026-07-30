@@ -160,6 +160,14 @@ class DistillPipeline:
         self.adapter_path: Optional[str] = None
         self.metrics: Dict[str, Any] = {}
         self._training_start_time: Optional[datetime] = None
+        # Per-stage outcome: ok | skipped | failed. A stage that quietly
+        # returned early used to leave the run reporting "completed".
+        self.stage_status: Dict[str, Dict[str, str]] = {}
+        self._current_stage: Optional[str] = None
+        # Values the run actually used where they differ from the config, so
+        # two runs reporting the same config cannot have behaved differently
+        # without saying so.
+        self.effective: Dict[str, Any] = {}
 
     # ── Chain ────────────────────────────────────────────────────────────────
 
@@ -230,13 +238,22 @@ class DistillPipeline:
 
         try:
             for step in chain:
-                getattr(self, f"_stage_{step}")()
+                self._current_stage = step
+                try:
+                    getattr(self, f"_stage_{step}")()
+                except Exception as e:
+                    self.stage_status[step] = {"status": "failed", "reason": str(e)}
+                    raise
+                self.stage_status.setdefault(step, {"status": "ok"})
 
+            skipped = [s for s, v in self.stage_status.items() if v["status"] != "ok"]
             self.logger.complete("Pipeline finished successfully")
+            self._log_stage_summary()
             self._write_training_summary()
             return {
                 "run_id": self.run_id,
-                "status": "completed",
+                "status": "completed_with_skips" if skipped else "completed",
+                "skipped_stages": skipped,
                 "adapter_path": self.adapter_path,
                 "metrics": self.metrics,
             }
@@ -245,8 +262,33 @@ class DistillPipeline:
             import traceback
             self.logger.fail(str(e))
             self.logger.error(traceback.format_exc())
+            self._log_stage_summary()
             self._write_training_summary()
-            return {"run_id": self.run_id, "status": "failed", "error": str(e)}
+            return {"run_id": self.run_id, "status": "failed", "error": str(e),
+                    "stages": self.stage_status}
+
+    def _skip_stage(self, reason: str):
+        """Record that the current stage did not do its work, and why.
+
+        A stage that returns early is not a stage that succeeded. Without this
+        a run with no evaluation at all still printed "Pipeline finished
+        successfully" and left eval_win_rate null for the dashboard to render
+        as a blank.
+        """
+        if self._current_stage:
+            self.stage_status[self._current_stage] = {"status": "skipped", "reason": reason}
+        self.logger.warning(f"SKIPPED {self._current_stage}: {reason}")
+
+    def _log_stage_summary(self):
+        parts = []
+        for step, info in self.stage_status.items():
+            mark = {"ok": "ok", "skipped": "SKIPPED", "failed": "FAILED"}[info["status"]]
+            parts.append(f"{step} {mark}")
+        if parts:
+            self.logger.info("Stages: " + " · ".join(parts))
+        for step, info in self.stage_status.items():
+            if info["status"] != "ok":
+                self.logger.warning(f"  {step} {info['status']}: {info.get('reason', '')}")
 
     def _stage_output_marker(self, step: str) -> Optional[Path]:
         """File whose existence means the stage completed (for dry-run display)."""
@@ -580,6 +622,9 @@ class DistillPipeline:
 
         max_seq_length = self.config.training.hyperparams.max_seq_length
         if free_vram < 5.0 and max_seq_length > 1024:
+            self.effective["max_seq_length"] = {
+                "configured": self.config.training.hyperparams.max_seq_length,
+                "effective": 1024, "reason": f"low VRAM ({free_vram:.1f} GB)"}
             max_seq_length = 1024
             self.logger.warning(f"Low VRAM ({free_vram:.1f} GB) — max_seq_length reduced to {max_seq_length}")
 
@@ -836,9 +881,15 @@ class DistillPipeline:
         if free_vram < 7.0:
             if self.method == "kto":
                 if max_seq_length > 512:
+                    self.effective["max_seq_length"] = {
+                        "configured": max_seq_length, "effective": 512,
+                        "reason": f"KTO on low VRAM ({free_vram:.1f} GB)"}
                     max_seq_length = 512
                     self.logger.warning(f"Low VRAM ({free_vram:.1f} GB) — KTO max_seq_length reduced to 512")
             elif batch_size > 1:
+                self.effective["batch_size"] = {
+                    "configured": batch_size, "effective": 1,
+                    "reason": f"low VRAM ({free_vram:.1f} GB), grad_accum x{grad_accum * batch_size}"}
                 grad_accum *= batch_size
                 batch_size = 1
                 self.logger.warning(
@@ -1022,6 +1073,8 @@ class DistillPipeline:
         except ValueError as e:
             if "dispatched on the CPU or the disk" not in str(e):
                 raise
+            self.effective["eval_max_seq_length"] = {
+                "configured": max_seq_length, "effective": 512, "reason": "OOM loading eval model"}
             self.logger.warning("OOM loading eval model, retrying with max_seq_length=512...")
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=model_ref, max_seq_length=512, dtype=None,
@@ -1140,11 +1193,11 @@ class DistillPipeline:
         self.logger.set_stage(Stage.EVALUATE)
         holdout = self.paths["holdout"]
         if not holdout.exists():
-            self.logger.warning(f"No holdout: {holdout} — run curate first, skipping evaluation")
+            self._skip_stage(f"no holdout at {holdout} — run curate first")
             return
         adapter = self.adapter_path or str(self.paths["adapter_dir"])
         if not (Path(adapter) / "adapter_config.json").exists():
-            self.logger.warning(f"No adapter at {adapter}, skipping evaluation")
+            self._skip_stage(f"no adapter at {adapter}")
             return
 
         judge = self.config.training.judge
@@ -1251,12 +1304,18 @@ class DistillPipeline:
             report["gap_closed"] = self._gap_closed(
                 summaries["base_vs_teacher"]["win_rate"], summaries["tuned_vs_teacher"]["win_rate"])
 
+        report["verdict"] = self._eval_verdict(summaries["tuned_vs_base"], use_llm)
+        self.metrics["eval_verdict"] = report["verdict"]
+
         report_path = self.logger.run_dir / "eval_report.json"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2, default=str)
         self.metrics["eval_report_path"] = str(report_path)
 
         self._write_eval_predictions(pairs, variants, tuned_gens, base_gens, results)
+        md = self._write_eval_report_md(report, judge)
+        self.logger.info(f"Evaluation report: {md}")
+        self.metrics["eval_report_md"] = str(md)
 
         # Headline metrics
         h = summaries["tuned_vs_base"]
@@ -1367,21 +1426,123 @@ class DistillPipeline:
         self.logger.info(f"Per-example predictions: {path}")
         self.metrics["eval_predictions_path"] = str(path)
 
+    def _write_eval_report_md(self, report: Dict[str, Any], judge) -> Path:
+        """The 7am report: verdict first, then the evidence that qualifies it."""
+        def pct(v):
+            return "n/a" if v is None else f"{v*100:.1f}%"
+
+        def flag(ok: bool) -> str:
+            return "ok" if ok else "WARN"
+
+        s = report["comparisons"]
+        h = s["tuned_vs_base"]
+        lo, hi = h["ci95"]
+        L = []
+        L.append(f"# Evaluation — {self.method} — {self.run_id[:8]}\n")
+        L.append(f"## VERDICT: {report['verdict']}\n")
+        L.append(f"**tuned vs base {pct(h['win_rate'])}** "
+                 f"(Δ {(h['win_rate']-0.5)*100:+.1f}pp, 95% CI [{lo*100:.1f}, {hi*100:.1f}], "
+                 f"sign p={h['sign_test_p']:.3f}, McNemar p={report['paired_vs_reference']['mcnemar_p']:.3f}), "
+                 f"n={report['n']}\n")
+        if report["verdict"] == "NO DETECTED EFFECT":
+            L.append(f"> The interval spans 50%, so this run cannot tell the tuned model from the "
+                     f"base model. Smallest effect resolvable at n={report['n']} is about "
+                     f"±{(hi-lo)/2*100:.0f}pp.\n")
+        if not report["valid_for_gating"]:
+            L.append(f"> Judge mode is `{report['judge_mode']}` — a formatting heuristic, not a "
+                     f"quality measure. No gate was evaluated.\n")
+
+        L.append("\n## Comparisons\n")
+        L.append("| comparison | win rate | 95% CI | W/L/T | sign p |")
+        L.append("|---|---|---|---|---|")
+        for name, c in s.items():
+            L.append(f"| {name} | {pct(c['win_rate'])} | "
+                     f"[{c['ci95'][0]*100:.1f}, {c['ci95'][1]*100:.1f}] | "
+                     f"{c['wins_x']}/{c['wins_y']}/{c['ties']} | {c['sign_test_p']:.3f} |")
+        if report.get("gap_closed") is not None:
+            L.append(f"\nGap to teacher closed: **{report['gap_closed']*100:.0f}%**\n")
+
+        L.append("\n## Validity\n")
+        judge_ok = report["judge_model"] and not report["judge_is_teacher"]
+        worst_tie = max((c["tie_rate"] for c in s.values()), default=0)
+        worst_bias = max((c["position_bias_rate"] for c in s.values()), default=0)
+        fails = sum(c["unparseable"] + c["errors"] for c in s.values())
+        adapter = report.get("adapter") or {}
+        L.append("| check | value | |")
+        L.append("|---|---|---|")
+        L.append(f"| judge | {report['judge_model'] or report['judge_mode']} | {flag(bool(judge_ok))} |")
+        L.append(f"| judge is teacher | {report['judge_is_teacher']} | {flag(not report['judge_is_teacher'])} |")
+        L.append(f"| judge failures | {fails} | {flag(fails == 0)} |")
+        L.append(f"| worst tie rate | {pct(worst_tie)} | {flag(worst_tie <= 0.40)} |")
+        L.append(f"| worst position bias | {pct(worst_bias)} | {flag(worst_bias <= 0.30)} |")
+        L.append(f"| adapter attached | {adapter.get('lora_modules', 0)} modules, "
+                 f"{adapter.get('lora_params', 0):,} params | {flag(adapter.get('trained', False))} |")
+        L.append(f"| base ≠ tuned | differ on "
+                 f"{pct(1 - report['base_tuned_identical_rate'])} of items | "
+                 f"{flag(report['base_tuned_identical_rate'] <= 0.90)} |")
+
+        curve = self.metrics.get("training_curve") or {}
+        reg = self.metrics.get("eval_regurgitation") or {}
+        if curve or reg:
+            L.append("\n## Overfitting\n")
+            if curve.get("holdout_points"):
+                L.append(f"- holdout loss: {curve['final_holdout_loss']:.4f} final, "
+                         f"best {curve['best_holdout_loss']:.4f} at step {curve['best_holdout_step']}")
+                if curve.get("generalization_gap") is not None:
+                    L.append(f"- generalization gap: {curve['generalization_gap']:.4f}")
+                L.append(f"- divergence detected: **{curve.get('divergence_detected')}**")
+                L.append(f"- epoch-boundary drops growing: **{curve.get('epoch_boundary_drops_growing')}**")
+                if curve.get("divergence_detected"):
+                    L.append(f"- **recommended: stop at step {curve['best_holdout_step']}** "
+                             f"(final is {curve['holdout_regression_from_best']:.4f} worse)")
+            else:
+                L.append("- no held-out loss recorded — memorisation could not be detected")
+            if reg:
+                L.append(f"- regurgitation: train F1 {reg['train_f1']:.3f} vs "
+                         f"holdout F1 {reg['holdout_f1']:.3f}"
+                         + (f" (**{reg['ratio']:.1f}x**)" if reg.get("ratio") else ""))
+
+        L.append("\n## Generation\n")
+        L.append("| variant | mean tokens | truncated | stopped on own | degenerate |")
+        L.append("|---|---|---|---|---|")
+        for name, g in report["generation"].items():
+            L.append(f"| {name} | {g['mean_tokens']:.0f} | {pct(g['truncation_rate'])} | "
+                     f"{pct(g['eos_rate'])} | {pct(g['degenerate_rate'])} |")
+
+        if self.effective:
+            L.append("\n## Effective config (differs from configured)\n")
+            for k, v in self.effective.items():
+                L.append(f"- `{k}`: configured {v['configured']} → used **{v['effective']}** ({v['reason']})")
+
+        L.append(f"\n---\nArtifacts: `eval_predictions.jsonl` · `metrics.jsonl` · "
+                 f"`eval_report.json` · `provenance.json`\n")
+
+        path = self.logger.run_dir / "eval_report.md"
+        path.write_text("\n".join(L))
+        return path
+
+    @staticmethod
+    def _eval_verdict(headline: Dict[str, Any], valid_for_gating: bool) -> str:
+        """Derive the verdict from the interval, never the point estimate.
+
+        A 12-8 split is a 60% point estimate and means nothing; requiring the
+        interval to clear 50% is what stops the run reporting that as a win.
+        """
+        if not valid_for_gating:
+            return "NOT MEASURED"
+        lo, hi = headline["ci95"]
+        if lo > 0.5:
+            return "IMPROVED"
+        if hi < 0.5:
+            return "REGRESSED"
+        return "NO DETECTED EFFECT"
+
     def _log_eval_verdict(self, summaries, paired, report, judge):
         """The one thing that has to be unambiguous at 7am."""
         h = summaries["tuned_vs_base"]
         lo, hi = h["ci95"]
         delta_pp = (h["win_rate"] - 0.5) * 100
-
-        if not report["valid_for_gating"]:
-            verdict = "NOT MEASURED"
-        elif lo > 0.5:
-            verdict = "IMPROVED"
-        elif hi < 0.5:
-            verdict = "REGRESSED"
-        else:
-            verdict = "NO DETECTED EFFECT"
-        self.metrics["eval_verdict"] = verdict
+        verdict = report["verdict"]
 
         self.logger.info("─" * 60)
         self.logger.info(
@@ -1433,7 +1594,7 @@ class DistillPipeline:
         self.logger.set_stage(Stage.BENCHMARK)
         adapter = self.adapter_path or str(self.paths["adapter_dir"])
         if not (Path(adapter) / "adapter_config.json").exists():
-            self.logger.warning(f"No adapter at {adapter}, skipping benchmark")
+            self._skip_stage(f"no adapter at {adapter}")
             return
         self.logger.info(f"Benchmarking: {adapter}")
 
@@ -1474,8 +1635,13 @@ class DistillPipeline:
             self.metrics["benchmark"] = benchmark_results
 
         except Exception as e:
-            self.logger.error(f"Benchmark failed: {e}")
+            # Recorded as a failed stage, not a metric nobody reads: the
+            # benchmark is the only forgetting guard, and a run that lost it
+            # must not report unqualified success.
             self.metrics["benchmark_error"] = str(e)
+            self.stage_status[self._current_stage or "benchmark"] = {
+                "status": "failed", "reason": f"benchmark failed: {e}"}
+            self.logger.error(f"Benchmark failed: {e}")
 
     # ── Deploy ────────────────────────────────────────────────────────────────
 
@@ -1483,7 +1649,7 @@ class DistillPipeline:
         self.logger.set_stage(Stage.DEPLOY)
         adapter_dir = Path(self.adapter_path or str(self.paths["adapter_dir"]))
         if not (adapter_dir / "adapter_config.json").exists():
-            self.logger.warning(f"No adapter at {adapter_dir}, skipping deployment")
+            self._skip_stage(f"no adapter at {adapter_dir}")
             return
 
         gguf_dir = adapter_dir / "gguf"
@@ -1550,8 +1716,12 @@ class DistillPipeline:
             "status": self.logger.status.stage.value,
             "started_at": self.logger.status.started_at,
             "completed_at": self.logger.status.completed_at,
+            "stages": self.stage_status,
+            "effective_config": self.effective,
             "metrics": self.metrics,
             "final_loss": self.metrics.get("final_loss"),
+            "verdict": self.metrics.get("eval_verdict"),
+            "delta_vs_base": self.metrics.get("eval_delta_vs_base"),
             "eval_win_rate": self.metrics.get("eval_student_win_rate"),
             "training_duration_sec": self.metrics.get("training_duration_sec"),
             "adapter_path": self.adapter_path,
@@ -1616,7 +1786,17 @@ def cmd_run(args):
     print("  RESULT")
     print("=" * 60)
     print(json.dumps(result, indent=2, default=str))
-    return 0 if result["status"] in ("completed", "dry_run") else 1
+
+    # 0 = every stage did its work, 1 = the run failed, 2 = the run finished but
+    # a stage did not run. A skipped evaluation is not a pass: it is the absence
+    # of a measurement, and it used to exit 0 alongside "finished successfully".
+    if result["status"] == "dry_run" or result["status"] == "completed":
+        return 0
+    if result["status"] == "completed_with_skips":
+        print(f"\nEXIT 2: finished, but these stages did not run: "
+              f"{', '.join(result['skipped_stages'])}")
+        return 2
+    return 1
 
 
 def cmd_status(args):
@@ -1708,6 +1888,11 @@ Examples:
   python distill.py run --method reopd --steps curate,collect
   python distill.py run --method sft --force                # redo all stages
   python distill.py status
+
+Exit codes:
+  0  all stages completed
+  1  the run failed
+  2  the run finished but a stage was skipped (e.g. no evaluation happened)
         """
     )
     sub = parser.add_subparsers(dest="command")
