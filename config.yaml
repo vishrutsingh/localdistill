@@ -103,9 +103,13 @@ training:
     eval_fraction: 0.02
 
   # Evaluation judge (evaluate stage, preference datasets only)
+  # Keep this in a different model family from models.teacher: LLM judges
+  # prefer their own family's outputs, so judging with the teacher inflates the
+  # win rate exactly when distillation worked. Every pair is judged in both
+  # orders (2 calls/example) so position bias is measured, not assumed away.
   judge:
-    mode: llm                 # heuristic | llm | human
-    llm_model: openrouter/deepseek/deepseek-chat
+    mode: llm                 # heuristic (smoke test only, cannot gate) | llm | human
+    llm_model: openrouter/openai/gpt-4o-mini
     max_examples: 50
     win_rate_target: 0.60
 

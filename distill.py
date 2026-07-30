@@ -891,6 +891,18 @@ class DistillPipeline:
         use_llm = judge.mode == "llm"
         self.logger.info(f"Judge: {'LLM (' + judge.llm_model + ')' if use_llm else 'heuristic'}, target: {judge.win_rate_target*100:.0f}%")
 
+        # Self-preference: an LLM judge favours its own family's outputs, so a
+        # judge that is also the teacher inflates the win rate in proportion to
+        # how well distillation worked — the bias tracks the effect.
+        judge_is_teacher = use_llm and judge.llm_model == self.config.models.teacher
+        self.metrics["eval_judge_is_teacher"] = judge_is_teacher
+        if judge_is_teacher:
+            self.logger.warning(
+                f"Judge and teacher are the same model ({judge.llm_model}) — the "
+                f"student was trained toward this model's outputs and is now being "
+                f"graded by it. Win rate is inflated; use a different judge family."
+            )
+
         eval_results = evaluate_model(
             model=model, tokenizer=tokenizer,
             holdout_path=str(holdout),
@@ -905,9 +917,20 @@ class DistillPipeline:
         self.metrics["eval_chosen_wins"] = eval_results["wins"]["chosen"]
         self.metrics["eval_ties"] = eval_results["wins"]["tie"]
         self.metrics["eval_student_win_rate"] = eval_results["student_win_rate"]
+        for key in ("win_rate_excl_ties", "tie_rate", "position_bias_rate",
+                    "judge_failures", "judge_errors", "judge_unparseable", "judge_mode"):
+            self.metrics[f"eval_{key}"] = eval_results[key]
 
         win_pct = eval_results["student_win_rate"] * 100
-        if eval_results["student_win_rate"] >= judge.win_rate_target:
+        if not eval_results["valid_for_gating"]:
+            # The heuristic judge scores formatting, not quality — it cannot
+            # clear a gate, and saying so is the whole point of having one.
+            self.logger.warning(
+                f"Win rate {win_pct:.1f}% — GATE NOT EVALUATED: judge mode is "
+                f"'{eval_results['judge_mode']}', which is a smoke test, not a "
+                f"quality measure. Set training.judge.mode=llm to gate."
+            )
+        elif eval_results["student_win_rate"] >= judge.win_rate_target:
             self.logger.success(f"GATE CLEARED: {win_pct:.1f}% ≥ {judge.win_rate_target*100:.0f}%")
         else:
             self.logger.warning(f"Gate not cleared: {win_pct:.1f}% < {judge.win_rate_target*100:.0f}%")

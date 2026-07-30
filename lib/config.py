@@ -95,7 +95,8 @@ class EarlyStoppingConfig:
 class JudgeConfig:
     """Evaluation judge selection."""
     mode: str = "heuristic"   # heuristic | llm | human
-    llm_model: str = "openrouter/deepseek/deepseek-chat"
+    # Keep in a different family from models.teacher — see config.yaml
+    llm_model: str = "openrouter/openai/gpt-4o-mini"
     max_examples: int = 50
     win_rate_target: float = 0.6
 
