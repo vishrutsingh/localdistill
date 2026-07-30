@@ -177,6 +177,10 @@ class ModelsConfig:
     # Concurrent teacher API calls (collect/generate stages). Calls within a
     # conversation stay sequential; conversations run in parallel.
     teacher_concurrency: int = 8
+    # Response budget for the teacher, and for the student at eval time. One
+    # value on purpose: if the student gets a smaller budget than the responses
+    # it is compared against, it is judged as incomplete for a harness reason.
+    teacher_max_tokens: int = 1024
 
 
 @dataclass

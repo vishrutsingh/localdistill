@@ -29,6 +29,10 @@ models:
   # parallel, turns within a conversation stay sequential). Lower if you hit
   # rate limits, raise if your plan allows.
   teacher_concurrency: 8
+  # Response budget for the teacher AND for the student at eval time — keep it
+  # one value. A student generating 512 tokens against 1024-token references is
+  # judged as incomplete for a harness reason, not a quality one.
+  teacher_max_tokens: 1024
 
 # ── Data Source ───────────────────────────────────────────────────────────────
 dataset:

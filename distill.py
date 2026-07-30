@@ -461,7 +461,10 @@ class DistillPipeline:
             prompt = next((m.get("content", "") for m in messages if m.get("role") == "user"), None)
             if not prompt:
                 return None
-            teacher_text = self._teacher_complete([{"role": "user", "content": prompt}], max_tokens=1024)
+            teacher_text = self._teacher_complete(
+                [{"role": "user", "content": prompt}],
+                max_tokens=self.config.models.teacher_max_tokens,
+            )
             if teacher_text is None:
                 return None
             return [
@@ -652,6 +655,25 @@ class DistillPipeline:
             ]}
 
         dataset = dataset.map(format_chatml, batched=True, num_proc=1)
+
+        # What the model actually sees, verbatim — the cheapest way to catch a
+        # chat-template mistake, and unrecoverable after the fact otherwise.
+        rendered = self.logger.run_dir / "rendered_example.txt"
+        rendered.write_text(dataset[0]["text"])
+        self.logger.info(f"Rendered training example: {rendered}")
+
+        # If training text does not end where generation stops, the model never
+        # learns to stop: it rambles to the token cap at eval and is then judged
+        # as incomplete. Looks like "the fine-tune made it worse".
+        eos = tokenizer.eos_token
+        n_check = min(50, len(dataset))
+        n_terminated = sum(1 for i in range(n_check) if dataset[i]["text"].rstrip().endswith(eos or "\0"))
+        if eos and n_terminated < n_check:
+            self.logger.warning(
+                f"{n_check - n_terminated}/{n_check} rendered training examples do not end "
+                f"with the EOS token ({eos!r}) — the model may never learn to stop. "
+                f"Inspect {rendered}"
+            )
 
         if self.method == "reopd":
             epochs = self.config.reopd.epochs
@@ -928,6 +950,8 @@ class DistillPipeline:
             judge_model=judge.llm_model,
             max_examples=judge.max_examples,
             logger=self.logger,
+            max_new_tokens=self.config.models.teacher_max_tokens,
+            max_seq_length=max_seq_length,
         )
 
         # Per-example record. Without this, aggregate counts are the only
@@ -948,6 +972,14 @@ class DistillPipeline:
                     "judge_raw": r.judge_raw,
                     "judge_error": r.judge_error,
                     "score_chosen": r.score_chosen,
+                    **({} if r.generation is None else {
+                        "student_tokens": r.generation.n_tokens,
+                        "student_truncated": r.generation.truncated,
+                        "student_eos": r.generation.eos,
+                        "student_repetition_ratio": round(r.generation.repetition_ratio, 4),
+                        "input_truncated": r.generation.input_truncated,
+                        "gen_seconds": round(r.generation.seconds, 3),
+                    }),
                 }, ensure_ascii=False) + "\n")
         self.logger.info(f"Per-example predictions: {predictions}")
         self.metrics["eval_predictions_path"] = str(predictions)
@@ -960,6 +992,8 @@ class DistillPipeline:
         for key in ("win_rate_excl_ties", "tie_rate", "position_bias_rate",
                     "judge_failures", "judge_errors", "judge_unparseable", "judge_mode"):
             self.metrics[f"eval_{key}"] = eval_results[key]
+        for key, value in eval_results["generation"].items():
+            self.metrics[f"eval_gen_{key}"] = value
 
         win_pct = eval_results["student_win_rate"] * 100
         if not eval_results["valid_for_gating"]:

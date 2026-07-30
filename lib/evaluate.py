@@ -58,6 +58,7 @@ class EvalResult:
     judge_consistent: bool = True
     judge_raw: List[str] = field(default_factory=list)
     judge_error: str = ""
+    generation: "Generation" = None
 
 
 def load_holdout(holdout_path: str) -> List[Dict]:
@@ -69,40 +70,175 @@ def load_holdout(holdout_path: str) -> List[Dict]:
     return pairs
 
 
-def generate_student_response(
+@dataclass
+class Generation:
+    """One model response plus the facts needed to trust it."""
+    text: str
+    n_tokens: int = 0
+    truncated: bool = False       # hit the cap without terminating
+    eos: bool = False             # terminated on its own
+    repetition_ratio: float = 0.0
+    input_truncated: bool = False
+    seconds: float = 0.0
+
+
+def prompt_messages(pair: Dict) -> List[Dict[str, str]]:
+    """Message prefix to condition on, from a holdout pair.
+
+    Everything up to the final assistant turn — not just the flat `prompt`
+    string. On multi-turn holdouts (i.e. any captured real conversation) the
+    flat form asks the model to answer the last question with no context while
+    grading it against a reference that had all of it.
+    """
+    chosen = pair.get("chosen") or []
+    last_assistant = max(
+        (i for i, m in enumerate(chosen) if m.get("role") == "assistant"),
+        default=None,
+    )
+    if last_assistant is not None and last_assistant > 0:
+        return [{"role": m["role"], "content": m["content"]} for m in chosen[:last_assistant]]
+    return [{"role": "user", "content": pair.get("prompt", "")}]
+
+
+def reference_response(pair: Dict) -> str:
+    """The reference (last assistant turn) from a holdout pair."""
+    for msg in reversed(pair.get("chosen") or []):
+        if msg.get("role") == "assistant":
+            return msg.get("content", "")
+    return ""
+
+
+def repetition_ratio(text: str, n: int = 4) -> float:
+    """Fraction of n-grams that are repeats. High values mean a decode loop.
+
+    Greedy decoding on a memorized model degenerates into repetition, and that
+    otherwise shows up only as a slightly lower win rate, indistinguishable
+    from any other cause.
+    """
+    words = text.split()
+    if len(words) < 2 * n:
+        return 0.0
+    grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    return 1.0 - len(set(grams)) / len(grams)
+
+
+def _terminator_ids(tokenizer) -> set:
+    """Token ids that mean 'the model stopped on its own'."""
+    ids = {tokenizer.eos_token_id}
+    for tok in ("<|eot_id|>", "<|im_end|>", "<|end|>"):
+        try:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+        except Exception:
+            continue
+        if tid is not None and tid != tokenizer.unk_token_id:
+            ids.add(tid)
+    return {i for i in ids if i is not None}
+
+
+def generate_batch(
     model,
     tokenizer,
-    prompt: str,
-    max_new_tokens: int = 512,
-) -> str:
-    """Generate response from student model."""
-    messages = [{"role": "user", "content": prompt}]
-    
-    # Apply chat template
-    input_text = tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
-        add_generation_prompt=True
-    )
-    
-    # Tokenize
-    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
-    
-    # Generate
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,  # Greedy for reproducibility
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    
-    # Decode only the new tokens
-    response = tokenizer.decode(
-        outputs[0][inputs.input_ids.shape[1]:], 
-        skip_special_tokens=True
-    )
-    
-    return response.strip()
+    message_lists: List[List[Dict[str, str]]],
+    max_new_tokens: int = 1024,
+    max_seq_length: int = 2048,
+    batch_size: int = 8,
+    logger=None,
+) -> List[Generation]:
+    """Greedy-decode a batch of conversations, recording generation health.
+
+    Greedy (do_sample=False) so the comparison is reproducible. Batched with
+    left padding, because at one-at-a-time the sample sizes that make a win
+    rate meaningful take hours, and people then turn the sample size back down.
+    """
+    import torch
+
+    terminators = _terminator_ids(tokenizer)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    prev_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"  # decoder-only models must pad on the left
+    max_input_len = max(16, max_seq_length - max_new_tokens)
+
+    texts = [
+        tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        for msgs in message_lists
+    ]
+
+    out: List[Generation] = []
+    try:
+        i = 0
+        while i < len(texts):
+            chunk = texts[i:i + batch_size]
+            # add_special_tokens=False: the chat template already emits BOS
+            enc = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True,
+                            max_length=max_input_len, add_special_tokens=False)
+            over_length = [
+                len(tokenizer(t, add_special_tokens=False)["input_ids"]) > max_input_len
+                for t in chunk
+            ]
+            enc = {k: v.to(model.device) for k, v in enc.items()}
+
+            started = time.time()
+            try:
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **enc,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+            except torch.cuda.OutOfMemoryError:
+                if batch_size == 1:
+                    raise
+                batch_size = max(1, batch_size // 2)
+                if logger:
+                    logger.warning(f"OOM during generation — retrying at batch_size={batch_size}")
+                torch.cuda.empty_cache()
+                continue
+            elapsed = time.time() - started
+
+            prompt_len = enc["input_ids"].shape[1]
+            for row, was_over in zip(outputs, over_length):
+                new_ids = row[prompt_len:].tolist()
+                hit_eos = any(t in terminators for t in new_ids)
+                # trim padding/terminators for an accurate token count
+                body = []
+                for t in new_ids:
+                    if t in terminators:
+                        break
+                    body.append(t)
+                text = tokenizer.decode(body, skip_special_tokens=True).strip()
+                out.append(Generation(
+                    text=text,
+                    n_tokens=len(body),
+                    truncated=(not hit_eos and len(new_ids) >= max_new_tokens),
+                    eos=hit_eos,
+                    repetition_ratio=repetition_ratio(text),
+                    input_truncated=was_over,
+                    seconds=elapsed / max(1, len(chunk)),
+                ))
+            i += len(chunk)
+    finally:
+        tokenizer.padding_side = prev_side
+
+    return out
+
+
+def generation_health(gens: List[Generation]) -> Dict:
+    """Aggregate generation diagnostics — the overfitting/decode tells."""
+    n = len(gens) or 1
+    lengths = [g.n_tokens for g in gens]
+    return {
+        "truncation_rate": sum(g.truncated for g in gens) / n,
+        "eos_rate": sum(g.eos for g in gens) / n,
+        "input_truncation_rate": sum(g.input_truncated for g in gens) / n,
+        "degenerate_rate": sum(g.repetition_ratio > 0.3 for g in gens) / n,
+        "empty_rate": sum(not g.text for g in gens) / n,
+        "short_rate": sum(len(g.text) < 20 for g in gens) / n,
+        "mean_tokens": sum(lengths) / n,
+        "max_repetition_ratio": max((g.repetition_ratio for g in gens), default=0.0),
+        "gen_seconds": sum(g.seconds for g in gens),
+    }
 
 
 def simple_judge(
@@ -314,9 +450,12 @@ def evaluate_model(
     judge_model: str = "openrouter/openai/gpt-4o-mini",
     max_examples: int = None,
     logger=None,
+    max_new_tokens: int = 1024,
+    max_seq_length: int = 2048,
+    batch_size: int = 8,
 ) -> Dict:
     """Evaluate model on holdout set.
-    
+
     Args:
         model: Loaded student model
         tokenizer: Tokenizer
@@ -325,7 +464,12 @@ def evaluate_model(
         judge_model: Model to use for judging
         max_examples: Limit number of examples to evaluate
         logger: Optional logger
-    
+        max_new_tokens: Generation budget. Must match the budget the reference
+            responses were produced with, or the student is penalised for
+            truncation that is an artefact of the harness.
+        max_seq_length: Total context; inputs are truncated to fit the budget
+        batch_size: Generation batch size (halved automatically on OOM)
+
     Returns:
         Dict with evaluation results and statistics
     """
@@ -334,7 +478,7 @@ def evaluate_model(
             logger.info(msg)
         else:
             print(f"[eval] {msg}")
-    
+
     pairs = load_holdout(holdout_path)
     if max_examples:
         pairs = pairs[:max_examples]
@@ -346,27 +490,39 @@ def evaluate_model(
     else:
         judge_fn = simple_judge
 
+    # Phase 1: generate everything in batches
+    log(f"Generating {len(pairs)} responses (batch_size={batch_size}, max_new_tokens={max_new_tokens})...")
+    generations = generate_batch(
+        model, tokenizer, [prompt_messages(p) for p in pairs],
+        max_new_tokens=max_new_tokens, max_seq_length=max_seq_length,
+        batch_size=batch_size, logger=logger,
+    )
+    health = generation_health(generations)
+    log(f"Generation: {health['gen_seconds']:.0f}s, mean {health['mean_tokens']:.0f} tokens, "
+        f"{health['truncation_rate']*100:.1f}% truncated, {health['eos_rate']*100:.1f}% stopped on their own")
+    if health["truncation_rate"] > 0.05:
+        log(f"  WARNING: {health['truncation_rate']*100:.0f}% of responses hit the token cap without "
+            f"finishing — they will be judged as incomplete regardless of quality")
+    if health["degenerate_rate"] > 0.05:
+        log(f"  WARNING: {health['degenerate_rate']*100:.0f}% of responses are repetitive "
+            f"(>30% duplicate 4-grams) — a decode-loop signature typical of an overfit model")
+    if health["eos_rate"] < 0.90:
+        log(f"  WARNING: only {health['eos_rate']*100:.0f}% of responses terminated on their own — "
+            f"check that training examples end with the tokenizer's EOS token")
+
+    # Phase 2: judge
     results = []
     wins = {"student": 0, "chosen": 0, "tie": 0}
     failures = {UNPARSEABLE: 0, ERROR: 0}
     inconsistent = 0
 
-    for i, pair in enumerate(pairs):
+    for i, (pair, gen) in enumerate(zip(pairs, generations)):
         prompt = pair["prompt"]
-        chosen_msgs = pair["chosen"]
-
-        # Extract chosen response (last assistant message)
-        chosen_response = ""
-        for msg in reversed(chosen_msgs):
-            if msg["role"] == "assistant":
-                chosen_response = msg["content"]
-                break
-
-        # Generate student response
-        log(f"[{i+1}/{len(pairs)}] Generating student response...")
-        student_response = generate_student_response(model, tokenizer, prompt)
+        chosen_response = reference_response(pair)
+        student_response = gen.text
 
         # Judge both orders; x=student, y=chosen
+        log(f"[{i+1}/{len(pairs)}] Judging...")
         verdict = judge_pair(prompt, student_response, chosen_response, judge_fn)
         winner = {"x": "student", "y": "chosen", "tie": "tie"}[verdict.winner]
         wins[winner] += 1
@@ -385,6 +541,7 @@ def evaluate_model(
             judge_consistent=verdict.consistent,
             judge_raw=verdict.raw,
             judge_error=verdict.error,
+            generation=gen,
         ))
 
         # Fail fast: a broken judge makes every later GPU-hour worthless
@@ -452,11 +609,45 @@ def evaluate_model(
         "judge_mode": "llm" if use_llm_judge else "heuristic",
         "judge_model": judge_model if use_llm_judge else None,
         "valid_for_gating": use_llm_judge,
+        "generation": health,
         "results": results,
     }
 
 
+def _smoke(model_name: str):
+    """Generation smoke test on real weights — needs a GPU, so it is not part
+    of the assert self-check. Run: python -m lib.evaluate --smoke <model>
+    """
+    from unsloth import FastLanguageModel
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name, max_seq_length=2048, dtype=None, load_in_4bit=True)
+    FastLanguageModel.for_inference(model)
+
+    convs = [
+        [{"role": "user", "content": "Name three primary colours."}],
+        [{"role": "user", "content": "Write a haiku about winter."}],
+        [{"role": "user", "content": "What is 17 * 23? Show your working."}],
+        [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"},
+         {"role": "user", "content": "What did I just say?"}],   # multi-turn context
+    ]
+    gens = generate_batch(model, tokenizer, convs, max_new_tokens=128, batch_size=4)
+    for c, g in zip(convs, gens):
+        print(f"\n--- {c[-1]['content'][:50]!r}")
+        print(f"    tokens={g.n_tokens} eos={g.eos} truncated={g.truncated} "
+              f"rep={g.repetition_ratio:.2f} {g.seconds:.1f}s")
+        print(f"    {g.text[:200]!r}")
+    print("\nhealth:", json.dumps(generation_health(gens), indent=2))
+    assert all(g.text for g in gens), "empty generation — batching or padding is wrong"
+    assert gens[-1].eos, "multi-turn generation did not terminate"
+    print("\nsmoke test passed")
+
+
 if __name__ == "__main__":
+    import sys
+    if "--smoke" in sys.argv:
+        _smoke(sys.argv[sys.argv.index("--smoke") + 1])
+        raise SystemExit(0)
+
     # Self-check: verdict parsing and both-order resolution. Run: python -m lib.evaluate
     assert parse_verdict("A") == "a"
     assert parse_verdict("B") == "b"
@@ -508,5 +699,33 @@ if __name__ == "__main__":
     w1, _, e1 = simple_judge("q", long_good, "no")
     w2, _, e2 = simple_judge("q", "no", long_good)
     assert (w1, e1) == ("a", "") and (w2, e2) == ("b", ""), (w1, w2)
+
+    # Repetition: the decode-loop signature must score high, prose must not.
+    assert repetition_ratio("the cat sat on the mat and then went home to sleep") == 0.0
+    assert repetition_ratio("a b c d " * 20) > 0.8
+    assert repetition_ratio("too short") == 0.0
+
+    # Multi-turn holdouts must be conditioned on the whole prefix, not the
+    # flat prompt — otherwise the model answers with no context and is graded
+    # against a reference that had all of it.
+    multi = {"prompt": "q1", "chosen": [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]}
+    assert prompt_messages(multi) == multi["chosen"][:3], prompt_messages(multi)
+    assert reference_response(multi) == "a2"
+    single = {"prompt": "q", "chosen": [
+        {"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]}
+    assert prompt_messages(single) == [{"role": "user", "content": "q"}]
+    assert reference_response(single) == "a"
+    # Degenerate holdout rows must not crash the prefix builder
+    assert prompt_messages({"prompt": "q", "chosen": []}) == [{"role": "user", "content": "q"}]
+
+    g = [Generation("ok", 10, False, True, 0.0), Generation("", 1024, True, False, 0.9)]
+    h = generation_health(g)
+    assert h["truncation_rate"] == 0.5 and h["eos_rate"] == 0.5
+    assert h["degenerate_rate"] == 0.5 and h["empty_rate"] == 0.5
 
     print("lib/evaluate.py self-check passed")
