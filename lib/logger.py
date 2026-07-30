@@ -157,6 +157,89 @@ def _get_loss_trend(metrics_history: List[Dict], window: int = 10) -> Optional[s
         return "plateau"
 
 
+def analyze_training(rows: List[Dict]) -> Dict[str, Any]:
+    """Read a run's metrics.jsonl back and name what the loss curve did.
+
+    _get_loss_trend fits a line over a 20-step window, which reports
+    "improving" throughout textbook memorisation — train loss falls smoothly
+    the whole time. The two signatures that actually matter are:
+
+      * divergence: held-out loss rising while training loss falls
+      * epoch-boundary drops: a discontinuity in training loss each time the
+        model starts re-reading data it has already seen, growing with each
+        epoch
+
+    Both are computed here, plus the best held-out checkpoint, which is the
+    answer to "how many epochs should I have run".
+    """
+    train = [(r.get("step", 0), r["loss"], r.get("epoch", 0.0))
+             for r in rows if "loss" in r and r.get("loss") == r.get("loss")]
+    holdout = [(r.get("step", 0), r["eval_holdout_loss"])
+               for r in rows if "eval_holdout_loss" in r]
+    subset = [(r.get("step", 0), r["eval_train_subset_loss"])
+              for r in rows if "eval_train_subset_loss" in r]
+
+    out: Dict[str, Any] = {
+        "train_points": len(train),
+        "holdout_points": len(holdout),
+        "final_train_loss": train[-1][1] if train else None,
+        # A single final batch is noise; the tail mean is what to compare runs on.
+        "mean_last_10_train_loss": (sum(l for _, l, _ in train[-10:]) / len(train[-10:])) if train else None,
+    }
+
+    if holdout:
+        best_step, best_loss = min(holdout, key=lambda p: p[1])
+        out["best_holdout_loss"] = best_loss
+        out["best_holdout_step"] = best_step
+        out["final_holdout_loss"] = holdout[-1][1]
+        out["holdout_series"] = holdout
+        # Rose on 2+ consecutive evals => past the useful point
+        rises = 0
+        max_rises = 0
+        for (_, prev), (_, cur) in zip(holdout, holdout[1:]):
+            rises = rises + 1 if cur > prev else 0
+            max_rises = max(max_rises, rises)
+        out["holdout_consecutive_rises"] = max_rises
+        out["divergence_detected"] = max_rises >= 2
+        out["holdout_regression_from_best"] = holdout[-1][1] - best_loss
+
+    if subset:
+        out["final_train_subset_loss"] = subset[-1][1]
+        out["train_subset_series"] = subset
+    if subset and holdout:
+        gaps = [h - s for (_, s), (_, h) in zip(subset, holdout)]
+        out["generalization_gap"] = gaps[-1]
+        out["generalization_gap_series"] = gaps
+        # A widening gap is only evidence of overfitting once held-out loss has
+        # actually regressed. While held-out loss is still falling, the gap
+        # widens simply because training loss falls faster — that is normal.
+        out["generalization_gap_widened"] = (
+            len(gaps) > 1
+            and gaps[-1] > gaps[0]
+            and out.get("holdout_regression_from_best", 0.0) > 0
+        )
+
+    # Epoch-boundary drops: mean train loss at the end of epoch N vs the start
+    # of epoch N+1. A model that has memorised recognises its data immediately.
+    by_epoch: Dict[int, List[float]] = {}
+    for _, loss, epoch in train:
+        by_epoch.setdefault(int(epoch), []).append(loss)
+    epoch_means = {e: sum(v) / len(v) for e, v in sorted(by_epoch.items()) if v}
+    out["epoch_mean_train_loss"] = epoch_means
+    drops = []
+    for e in sorted(by_epoch)[:-1]:
+        tail = by_epoch[e][-5:]
+        head = by_epoch[e + 1][:5] if (e + 1) in by_epoch else []
+        if tail and head:
+            drops.append({"boundary": f"{e}->{e+1}",
+                          "drop": sum(tail) / len(tail) - sum(head) / len(head)})
+    out["epoch_boundary_drops"] = drops
+    out["epoch_boundary_drops_growing"] = (
+        len(drops) > 1 and all(b["drop"] > a["drop"] for a, b in zip(drops, drops[1:]))
+    )
+    return out
+
+
 def _package_versions() -> Dict[str, str]:
     """Versions of the packages that change results between runs."""
     from importlib.metadata import version, PackageNotFoundError
@@ -528,3 +611,53 @@ def create_logger(run_id: str, config) -> DistillLogger:
     )
     set_logger(logger)
     return logger
+
+
+if __name__ == "__main__":
+    # Self-check for analyze_training. Run: python -m lib.logger
+    def _rows(train, holdout=None, subset=None, epochs=3):
+        rows, per = [], max(1, len(train) // epochs)
+        for i, l in enumerate(train):
+            rows.append({"step": i + 1, "epoch": i // per, "loss": l})
+        for j, hv in enumerate(holdout or []):
+            row = {"step": (j + 1) * max(1, len(train) // len(holdout)),
+                   "eval_holdout_loss": hv}
+            if subset:
+                row["eval_train_subset_loss"] = subset[j]
+            rows.append(row)
+        return rows
+
+    # Healthy: both losses fall. The gap widens slightly because training loss
+    # falls faster — that must NOT be reported as overfitting.
+    ok = analyze_training(_rows([1.8, 1.6, 1.5, 1.4, 1.3, 1.25, 1.2, 1.15, 1.1],
+                                holdout=[1.5, 1.35, 1.3], subset=[1.45, 1.28, 1.20]))
+    assert ok["divergence_detected"] is False, ok
+    assert ok["generalization_gap_widened"] is False, ok
+    assert ok["holdout_regression_from_best"] == 0.0
+
+    # Memorising: training loss collapses with a growing drop at each epoch
+    # boundary while held-out loss climbs.
+    bad = analyze_training(_rows([1.8, 1.7, 1.6, 1.2, 1.1, 1.0, 0.3, 0.2, 0.1],
+                                 holdout=[1.40, 1.45, 1.62], subset=[1.35, 0.95, 0.35]))
+    assert bad["divergence_detected"] is True, bad
+    assert bad["holdout_consecutive_rises"] == 2, bad
+    assert bad["generalization_gap_widened"] is True, bad
+    assert bad["epoch_boundary_drops_growing"] is True, bad["epoch_boundary_drops"]
+    assert bad["best_holdout_step"] == 3 and bad["holdout_regression_from_best"] > 0.2, bad
+
+    # No held-out data: degrade without crashing, and claim nothing
+    none = analyze_training(_rows([1.5, 1.4, 1.3]))
+    assert none["holdout_points"] == 0 and "divergence_detected" not in none
+    assert none["mean_last_10_train_loss"] is not None
+
+    # The trailing trainer summary row has no `loss` key. The old code read
+    # log_history[-1].get("loss", 0) and reported final_loss 0.0 — a perfect run.
+    tail = analyze_training([{"step": 1, "loss": 1.0}, {"step": 2, "loss": 0.9},
+                             {"train_runtime": 12.0}])
+    assert tail["mean_last_10_train_loss"] == 0.95, tail
+    # NaN steps are excluded rather than poisoning the mean
+    nan = analyze_training([{"step": 1, "loss": 1.0}, {"step": 2, "loss": float("nan")},
+                            {"step": 3, "loss": 0.8}])
+    assert nan["train_points"] == 2, nan
+
+    print("lib/logger.py self-check passed")

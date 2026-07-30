@@ -48,7 +48,9 @@ def _file_key(path: Path) -> str:
 
 
 def compute_eval_artifacts(config, holdout: Path, n_examples: int,
-                           adapter_dir: Optional[Path] = None) -> Dict[str, Path]:
+                           adapter_dir: Optional[Path] = None,
+                           train_data: Optional[Path] = None,
+                           n_regurgitation: int = 0) -> Dict[str, Path]:
     """Paths for cached evaluation generations, content-addressed like the rest.
 
     The baseline is the expensive part of an honest comparison — the same base
@@ -75,11 +77,16 @@ def compute_eval_artifacts(config, holdout: Path, n_examples: int,
     tuned_key = _key({**decode, "adapter": Path(adapter_dir).name if adapter_dir else "",
                       "quantization": config.training.quantization})
 
-    return {
+    out = {
         "base": EVALS_DIR / f"base_{base_key}" / "generations.jsonl",
         "tuned": EVALS_DIR / f"tuned_{tuned_key}" / "generations.jsonl",
         "teacher": EVALS_DIR / f"teacher_{teacher_key}" / "generations.jsonl",
     }
+    if train_data and n_regurgitation and Path(train_data).exists():
+        regurg_key = _key({"tuned": tuned_key, "train": _file_key(Path(train_data)),
+                           "k": n_regurgitation})
+        out["regurgitation"] = EVALS_DIR / f"regurgitation_{regurg_key}" / "generations.jsonl"
+    return out
 
 
 def compute_artifacts(config: Config, method: str, from_adapter: Optional[str] = None) -> Dict[str, Path]:

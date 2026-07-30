@@ -122,6 +122,27 @@ def repetition_ratio(text: str, n: int = 4) -> float:
     return 1.0 - len(set(grams)) / len(grams)
 
 
+def token_f1(prediction: str, reference: str) -> float:
+    """Token-overlap F1 between two texts (SQuAD-style), 0..1.
+
+    Used for the regurgitation probe: high similarity to *training* targets
+    next to low similarity on held-out targets is memorisation, stated as a
+    number instead of inferred from a loss curve.
+    """
+    from collections import Counter
+    pred = prediction.lower().split()
+    ref = reference.lower().split()
+    if not pred or not ref:
+        return float(pred == ref)
+    overlap = Counter(pred) & Counter(ref)
+    same = sum(overlap.values())
+    if same == 0:
+        return 0.0
+    precision = same / len(pred)
+    recall = same / len(ref)
+    return 2 * precision * recall / (precision + recall)
+
+
 def _terminator_ids(tokenizer) -> set:
     """Token ids that mean 'the model stopped on its own'."""
     ids = {tokenizer.eos_token_id}
@@ -847,5 +868,11 @@ if __name__ == "__main__":
 
     assert identical_rate(["a", "b"], ["a", "c"]) == 0.5
     assert identical_rate([], []) == 0.0
+
+    # Regurgitation probe metric
+    assert token_f1("the cat sat", "the cat sat") == 1.0
+    assert token_f1("totally different words here", "nothing alike at all") == 0.0
+    assert 0.4 < token_f1("the cat sat on the mat", "the cat sat") < 0.75
+    assert token_f1("", "") == 1.0 and token_f1("x", "") == 0.0
 
     print("lib/evaluate.py self-check passed")

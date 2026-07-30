@@ -75,7 +75,10 @@ if sys.version_info >= (3, 14):
 sys.path.insert(0, str(Path(__file__).parent))
 
 from lib.config import load_config, save_config, print_config, validate_config, Config, METHODS, PREFERENCE_METHODS
-from lib.logger import DistillLogger, create_logger, write_provenance, PipelineStage as Stage
+from lib.logger import (
+    DistillLogger, analyze_training, create_logger, write_provenance,
+    PipelineStage as Stage,
+)
 from lib.dataset import DatasetLoader, split_dataset
 from lib.deploy import (
     export_gguf, register_ollama_model, list_adapters,
@@ -83,7 +86,7 @@ from lib.deploy import (
 )
 from lib.methods import compute_artifacts, compute_eval_artifacts, latest_adapter, ADAPTERS_DIR
 from lib.evaluate import (
-    Generation, adapter_fingerprint, generate_batch, generation_health, identical_rate,
+    Generation, adapter_fingerprint, token_f1, generate_batch, generation_health, identical_rate,
     judge_comparison, llm_judge, load_holdout, paired_outcomes, prompt_messages,
     reference_response, simple_judge,
 )
@@ -638,6 +641,53 @@ class DistillPipeline:
             "save_total_limit": chk.keep_last,
         }
 
+    def _build_eval_sets(self, dataset, format_chatml, seed, es):
+        """Held-out loss datasets. Returns (eval_dataset_dict_or_None, train_dataset).
+
+        Always on, and decoupled from early stopping — eval loss is the cheapest
+        memorisation signal there is, and tying it to `early_stopping.enabled`
+        (default false) meant a default run produced no generalisation signal at
+        all. Two sets, because the gap between them is the actual signature:
+
+          holdout      — never trained on; generalisation
+          train_subset — sampled from the training data and LEFT IN it, so
+                         measuring memorisation costs no training examples
+
+        Falls back to carving a small split only when there is no curated
+        holdout (non-preference sources), which is the one case where measuring
+        generalisation does cost data.
+        """
+        eval_sets = {}
+        cap = 100  # bound eval cost; 100 examples is plenty for a loss estimate
+
+        n_subset = min(cap, max(8, int(len(dataset) * 0.05)))
+        if len(dataset) >= 16:
+            eval_sets["train_subset"] = dataset.shuffle(seed=seed).select(range(n_subset))
+
+        holdout = self.paths["holdout"]
+        if holdout.exists():
+            from datasets import Dataset
+            rows = []
+            with open(holdout) as f:
+                for line in f:
+                    msgs = json.loads(line).get("chosen") or []
+                    if msgs:
+                        rows.append({"messages": msgs})
+            if rows:
+                ds = Dataset.from_list(rows[:cap]).map(format_chatml, batched=True, num_proc=1)
+                eval_sets["holdout"] = ds
+        elif es.enabled and len(dataset) >= 50:
+            n_eval = max(8, int(len(dataset) * es.eval_fraction))
+            split = dataset.train_test_split(test_size=n_eval, seed=seed)
+            dataset = split["train"]
+            eval_sets["holdout"] = split["test"]
+            self.logger.warning(
+                f"No curated holdout — carved {n_eval} examples out of the training set "
+                f"for held-out loss. These examples are NOT trained on."
+            )
+
+        return (eval_sets or None), dataset
+
     def _train_sft(self, adapter_dir, done_marker, dataset_path, resume_ckpt, max_seq_length):
         """SFT for methods sft and reopd (reopd differs only in data + lr/epochs)."""
         import torch
@@ -690,19 +740,17 @@ class DistillPipeline:
             lr = h.learning_rate
             scheduler = h.lr_scheduler
 
-        # Early stopping needs eval loss: carve a small split off the train set
-        es = cfg.early_stopping
-        eval_dataset = None
-        if es.enabled and len(dataset) >= 50:
-            n_eval = max(8, int(len(dataset) * es.eval_fraction))
-            split = dataset.train_test_split(test_size=n_eval, seed=h.seed)
-            dataset, eval_dataset = split["train"], split["test"]
-            self.logger.info(f"Early stopping: eval split={len(eval_dataset)} examples")
-
         adapter_dir.mkdir(parents=True, exist_ok=True)
+        es = cfg.early_stopping
+        eval_dataset, dataset = self._build_eval_sets(dataset, format_chatml, h.seed, es)
+
         steps_per_epoch = max(1, len(dataset) // (h.batch_size * h.gradient_accumulation_steps))
         total_steps = steps_per_epoch * epochs
         self.logger.info(f"Steps: ~{total_steps} ({steps_per_epoch}/epoch x {epochs}), lr={lr:.2e}, scheduler={scheduler}")
+
+        # Bound evaluation overhead: at most ~25 evals across the run, never
+        # more often than checkpoints.
+        eval_steps = max(cfg.checkpoint.steps, total_steps // 25) if eval_dataset else None
 
         args_dict = {
             **self._common_training_args(),
@@ -710,17 +758,25 @@ class DistillPipeline:
             "learning_rate": lr,
             "lr_scheduler_type": scheduler,
             "output_dir": str(adapter_dir),
-            "eval_strategy": "steps" if eval_dataset is not None else "no",
-            "eval_steps": cfg.checkpoint.steps if eval_dataset is not None else None,
+            "eval_strategy": "steps" if eval_dataset else "no",
+            "eval_steps": eval_steps,
         }
 
         callbacks = [_make_log_callback(self.logger, self.method, total_steps)]
-        if eval_dataset is not None:
-            callbacks.append(EarlyStoppingCallback(
-                early_stopping_patience=es.patience,
-                early_stopping_threshold=es.min_delta,
-            ))
-            self.logger.info(f"Early stopping: patience={es.patience} evals, min_delta={es.min_delta}")
+        if eval_dataset:
+            self.logger.info(
+                f"Held-out loss: every {eval_steps} steps on "
+                + ", ".join(f"{k} ({len(v)})" for k, v in eval_dataset.items())
+            )
+            if es.enabled and "holdout" in eval_dataset:
+                args_dict["metric_for_best_model"] = "eval_holdout_loss"
+                args_dict["greater_is_better"] = False
+                callbacks.append(EarlyStoppingCallback(
+                    early_stopping_patience=es.patience,
+                    early_stopping_threshold=es.min_delta,
+                ))
+                self.logger.info(f"Early stopping on holdout loss: patience={es.patience} evals, "
+                                 f"min_delta={es.min_delta}")
 
         trainer = SFTTrainer(
             model=model, processing_class=tokenizer,
@@ -854,8 +910,16 @@ class DistillPipeline:
         self.metrics["completed_steps"] = trainer.state.global_step
         self.metrics["training_examples"] = n_examples
         self.metrics["total_steps"] = total_steps
-        if trainer.state.log_history:
-            self.metrics["final_loss"] = trainer.state.log_history[-1].get("loss", 0)
+
+        # Read the run's own metrics.jsonl back and say what the curve did.
+        # `log_history[-1]["loss"]` was a single noisy batch — and defaulted to
+        # 0 when the final row had no loss key, which reads as a perfect run.
+        metrics_file = self.logger.log_files["metrics"]
+        rows = [json.loads(l) for l in open(metrics_file)] if metrics_file.exists() else []
+        curve = analyze_training(rows)
+        self.metrics["final_loss"] = curve.get("mean_last_10_train_loss")
+        self.metrics["training_curve"] = curve
+        self._log_training_curve(curve)
 
         self.logger.info("Saving final adapter...")
         model.save_pretrained(str(adapter_dir))
@@ -882,6 +946,53 @@ class DistillPipeline:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _log_training_curve(self, curve: Dict[str, Any]):
+        """Report what the loss curve did, including the parts that mean 'stop'."""
+        if not curve.get("train_points"):
+            return
+        self.logger.info(
+            f"Train loss: {curve['mean_last_10_train_loss']:.4f} (mean of last 10 steps)"
+        )
+        by_epoch = curve.get("epoch_mean_train_loss") or {}
+        if len(by_epoch) > 1:
+            self.logger.info("  per-epoch train loss: "
+                             + ", ".join(f"e{e}={v:.3f}" for e, v in by_epoch.items()))
+
+        if curve.get("holdout_points"):
+            self.logger.info(
+                f"Holdout loss: {curve['final_holdout_loss']:.4f} final, "
+                f"best {curve['best_holdout_loss']:.4f} at step {curve['best_holdout_step']}"
+            )
+            if curve.get("generalization_gap") is not None:
+                self.logger.info(f"  generalization gap (holdout - train subset): "
+                                 f"{curve['generalization_gap']:.4f}")
+            if curve.get("divergence_detected"):
+                self.logger.warning(
+                    f"OVERFITTING: holdout loss rose on {curve['holdout_consecutive_rises']} "
+                    f"consecutive evals while training loss fell. Best checkpoint was step "
+                    f"{curve['best_holdout_step']} ({curve['holdout_regression_from_best']:.4f} "
+                    f"worse by the end) — consider fewer epochs or enabling early stopping."
+                )
+            if curve.get("generalization_gap_widened"):
+                self.logger.warning(
+                    "OVERFITTING: the gap between held-out and training-subset loss widened "
+                    "over the run — the model is fitting the training data specifically."
+                )
+        else:
+            self.logger.warning(
+                "No held-out loss was recorded — memorisation cannot be detected for this run."
+            )
+
+        drops = curve.get("epoch_boundary_drops") or []
+        if drops:
+            self.logger.info("  epoch-boundary loss drops: "
+                             + ", ".join(f"{d['boundary']} {d['drop']:+.3f}" for d in drops))
+            if curve.get("epoch_boundary_drops_growing"):
+                self.logger.warning(
+                    "MEMORISATION: training loss drops further at each epoch boundary — the "
+                    "model is recognising examples it has already seen rather than generalising."
+                )
 
     def _latest_checkpoint(self, adapter_dir: Path) -> Optional[Path]:
         """Latest resumable HF checkpoint in the keyed adapter dir, if training
@@ -1066,7 +1177,11 @@ class DistillPipeline:
             )
 
         # ── Generate every variant on the same items ─────────────────────────
-        cache = compute_eval_artifacts(self.config, holdout, len(pairs), Path(adapter))
+        cache = compute_eval_artifacts(
+            self.config, holdout, len(pairs), Path(adapter),
+            train_data=self.paths["train_dataset"],
+            n_regurgitation=judge.regurgitation_examples,
+        )
         tuned_gens, fp = self._generate_variant(
             "tuned", adapter, prefixes, cache["tuned"], max_seq_length, fingerprint=True)
         base_gens, _ = self._generate_variant(
@@ -1080,6 +1195,14 @@ class DistillPipeline:
         if judge.compare_teacher:
             teacher = self._teacher_holdout_responses(pairs, cache["teacher"])
             variants["teacher"] = teacher
+
+        # Does it reproduce its training data? High similarity to training
+        # targets next to low similarity on held-out targets is memorisation
+        # stated directly, rather than inferred from a loss curve.
+        if judge.regurgitation_examples and "regurgitation" in cache:
+            self.metrics["eval_regurgitation"] = self._regurgitation_probe(
+                adapter, cache["regurgitation"], max_seq_length,
+                judge.regurgitation_examples, tuned, references)
 
         # Behavioural check: an adapter that attached but changed nothing gives
         # a Δ of 0 that looks exactly like "the method does not work".
@@ -1148,6 +1271,54 @@ class DistillPipeline:
             self.metrics[f"eval_{key}_win_rate"] = comp["win_rate"]
 
         self._log_eval_verdict(summaries, paired, report, judge)
+
+    def _regurgitation_probe(self, adapter, cache: Path, max_seq_length, k,
+                             holdout_responses, holdout_references):
+        """Compare the model's output to its own training targets.
+
+        train_f1 ~ holdout_f1  -> learned the distribution
+        train_f1 >> holdout_f1 -> memorised the training set
+        """
+        train_path = self.paths["train_dataset"]
+        if not train_path.exists():
+            self.logger.info("Regurgitation probe skipped: training data not present")
+            return None
+
+        rows = []
+        with open(train_path) as f:
+            for i, line in enumerate(f):
+                if i >= k:
+                    break
+                rows.append(json.loads(line))
+        examples = [(prompt_messages({"chosen": r.get("messages", [])}),
+                     reference_response({"chosen": r.get("messages", [])})) for r in rows]
+        examples = [(p, t) for p, t in examples if p and t]
+        if not examples:
+            self.logger.info("Regurgitation probe skipped: no usable training examples")
+            return None
+
+        prefixes = [p for p, _ in examples]
+        targets = [t for _, t in examples]
+        gens, _ = self._generate_variant("regurgitation", adapter, prefixes, cache, max_seq_length)
+
+        train_f1 = sum(token_f1(g.text, t) for g, t in zip(gens, targets)) / len(targets)
+        holdout_f1 = (sum(token_f1(r, ref) for r, ref in zip(holdout_responses, holdout_references))
+                      / len(holdout_references)) if holdout_references else 0.0
+        result = {"train_f1": train_f1, "holdout_f1": holdout_f1,
+                  "ratio": (train_f1 / holdout_f1) if holdout_f1 else None,
+                  "n_train": len(targets), "n_holdout": len(holdout_references)}
+
+        self.logger.info(
+            f"Regurgitation: train F1 {train_f1:.3f} (n={len(targets)}) vs "
+            f"holdout F1 {holdout_f1:.3f} (n={len(holdout_references)})"
+        )
+        if holdout_f1 > 0 and train_f1 > 2 * holdout_f1 and train_f1 > 0.5:
+            self.logger.warning(
+                f"MEMORISATION: the model reproduces its training targets "
+                f"{train_f1/holdout_f1:.1f}x more closely than held-out targets — it has "
+                f"learned specific examples rather than the distribution."
+            )
+        return result
 
     @staticmethod
     def _gap_closed(base_vs_teacher: float, tuned_vs_teacher: float):

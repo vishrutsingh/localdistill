@@ -99,7 +99,11 @@ training:
     steps: 100
     keep_last: 2
 
-  # Early stopping on eval loss (carves a small eval split off the train set)
+  # Held-out loss is ALWAYS computed (on the curated holdout plus a subset of
+  # the training data that stays in training) — it is the cheapest memorisation
+  # signal there is and tying it to this flag meant a default run had none.
+  # This flag only controls whether the run STOPS early on it.
+  # eval_fraction applies only when there is no curated holdout to use.
   early_stopping:
     enabled: false
     patience: 3               # evals without improvement
@@ -126,6 +130,10 @@ training:
     # student -> teacher gap the run closed. Costs one extra pass of teacher API
     # calls (cached in evals/, so paid once per holdout+teacher).
     compare_teacher: true
+    # Memorisation probe: regenerate this many TRAINING prompts and compare the
+    # output to the training targets. Similarity far above the held-out
+    # similarity means the model learned specific examples, not the task.
+    regurgitation_examples: 50
 
 # ── ReOPD (training.method: reopd) ────────────────────────────────────────────
 reopd:
