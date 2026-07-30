@@ -74,7 +74,7 @@ if sys.version_info >= (3, 14):
 sys.path.insert(0, str(Path(__file__).parent))
 
 from lib.config import load_config, save_config, print_config, validate_config, Config, METHODS, PREFERENCE_METHODS
-from lib.logger import DistillLogger, create_logger, PipelineStage as Stage
+from lib.logger import DistillLogger, create_logger, write_provenance, PipelineStage as Stage
 from lib.dataset import DatasetLoader, split_dataset
 from lib.deploy import (
     export_gguf, register_ollama_model, list_adapters,
@@ -86,16 +86,22 @@ from lib.methods import compute_artifacts, latest_adapter, ADAPTERS_DIR
 # ── Trainer helpers ───────────────────────────────────────────────────────────
 
 def _make_log_callback(logger, method: str, total_steps: int):
-    """TrainerCallback that streams loss into the distill logger."""
+    """TrainerCallback that streams every trainer log row into the distill logger.
+
+    Forwards the whole `logs` dict, not just `loss`: eval_loss and the
+    preference-method reward metrics are the diagnostics that matter, and
+    filtering on `"loss" in logs` dropped every one of them.
+    """
     from transformers import TrainerCallback
 
     class LogCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs and "loss" in logs:
-                logger.log_training_step(
-                    state.global_step, logs["loss"], logs.get("learning_rate"),
-                    total_steps=total_steps, phase=method,
-                )
+            if not logs:
+                return
+            logger.log_metrics_row(
+                {"step": state.global_step, "epoch": state.epoch, **logs},
+                total_steps=total_steps, phase=method,
+            )
 
     return LogCallback()
 
@@ -200,6 +206,18 @@ class DistillPipeline:
 
         config_snapshot = self.logger.run_dir / "config.yaml"
         save_config(self.config, str(config_snapshot))
+        write_provenance(self.logger.run_dir, {
+            "run_id": self.run_id,
+            "method": self.method,
+            "stages": chain,
+            "student": self.config.models.student,
+            "teacher": self.config.models.teacher,
+            "judge": self.config.training.judge.llm_model,
+            "seed": self.config.training.hyperparams.seed,
+            "from_adapter": self.from_adapter,
+            "force": self.force,
+            "artifacts": {k: str(v) for k, v in self.paths.items()},
+        })
 
         try:
             for step in chain:
@@ -911,6 +929,28 @@ class DistillPipeline:
             max_examples=judge.max_examples,
             logger=self.logger,
         )
+
+        # Per-example record. Without this, aggregate counts are the only
+        # surviving evidence: you cannot see what the model actually said, and
+        # re-judging (different judge, fixed parser) means regenerating
+        # everything on the GPU instead of replaying a file.
+        predictions = self.logger.run_dir / "eval_predictions.jsonl"
+        with open(predictions, "w") as f:
+            for i, r in enumerate(eval_results["results"]):
+                f.write(json.dumps({
+                    "idx": i,
+                    "prompt": r.prompt,
+                    "student_response": r.student_response,
+                    "reference_response": r.chosen_response,
+                    "winner": r.winner,
+                    "judge_status": r.judge_status,
+                    "judge_consistent": r.judge_consistent,
+                    "judge_raw": r.judge_raw,
+                    "judge_error": r.judge_error,
+                    "score_chosen": r.score_chosen,
+                }, ensure_ascii=False) + "\n")
+        self.logger.info(f"Per-example predictions: {predictions}")
+        self.metrics["eval_predictions_path"] = str(predictions)
 
         self.metrics["eval_total"] = eval_results["total"]
         self.metrics["eval_student_wins"] = eval_results["wins"]["student"]

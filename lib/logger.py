@@ -157,6 +157,63 @@ def _get_loss_trend(metrics_history: List[Dict], window: int = 10) -> Optional[s
         return "plateau"
 
 
+def _package_versions() -> Dict[str, str]:
+    """Versions of the packages that change results between runs."""
+    from importlib.metadata import version, PackageNotFoundError
+    out = {}
+    for pkg in ("torch", "transformers", "trl", "peft", "unsloth", "datasets",
+                "accelerate", "bitsandbytes", "litellm"):
+        try:
+            out[pkg] = version(pkg)
+        except PackageNotFoundError:
+            out[pkg] = "not-installed"
+    return out
+
+
+def write_provenance(run_dir: Path, extra: Dict[str, Any] = None) -> Path:
+    """Record what produced a run, so a result can be reproduced or bisected.
+
+    Cheap insurance: without the code SHA and the library versions, two runs
+    that report the same config can have trained and evaluated differently and
+    there is no way to find out afterwards.
+    """
+    import platform
+    import subprocess
+
+    def _git(*args) -> str:
+        try:
+            r = subprocess.run(["git", *args], capture_output=True, text=True,
+                               timeout=5, cwd=str(Path(__file__).resolve().parent.parent))
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    gpu = "none"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            p = torch.cuda.get_device_properties(0)
+            gpu = f"{p.name} ({p.total_memory // (1024**3)} GB)"
+    except Exception:
+        pass
+
+    prov = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "git_sha": _git("rev-parse", "HEAD"),
+        "git_branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "git_dirty": bool(_git("status", "--porcelain")),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "gpu": gpu,
+        "packages": _package_versions(),
+        **(extra or {}),
+    }
+    path = run_dir / "provenance.json"
+    with open(path, "w") as f:
+        json.dump(prov, f, indent=2, default=str)
+    return path
+
+
 # ── Logger ────────────────────────────────────────────────────────────────────
 
 class DistillLogger:
@@ -204,6 +261,7 @@ class DistillLogger:
         self.log_files = {
             "main": self.run_dir / "run.log",
             "events": self.run_dir / "events.jsonl",
+            "metrics": self.run_dir / "metrics.jsonl",
             "curate": self.run_dir / "curate.log",
             "train": self.run_dir / "train.log",
             "evaluate": self.run_dir / "evaluate.log",
@@ -305,6 +363,29 @@ class DistillLogger:
             })
             self._save_status()
             self._last_progress_update = now
+
+    def log_metrics_row(self, row: Dict[str, Any], **extra):
+        """Persist one trainer log row verbatim to metrics.jsonl.
+
+        Every key the trainer emits is kept: eval_loss, grad_norm, epoch, and
+        the preference-method diagnostics (rewards/accuracies, rewards/margins,
+        rewards/chosen) that say far more than `loss` does. status.json only
+        ever holds the latest values, and events.jsonl is throttled, so this is
+        the only full-resolution record of a run.
+        """
+        with open(self.log_files["metrics"], "a") as f:
+            f.write(json.dumps({
+                "wall_clock": datetime.now(timezone.utc).isoformat(),
+                **row,
+            }, default=str) + "\n")
+
+        if "loss" in row:
+            self.log_training_step(
+                row.get("step", 0), row["loss"], row.get("learning_rate"), **extra
+            )
+        elif "eval_loss" in row:
+            self.status.metrics["eval_loss"] = row["eval_loss"]
+            self.info(f"Step {row.get('step', 0)}: eval_loss={row['eval_loss']:.4f}", **row)
 
     def log_training_step(self, step: int, loss: float, lr: float = None, **extra):
         """Log a training step, detect NaN, track trends, update progress."""
